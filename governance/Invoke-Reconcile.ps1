@@ -267,6 +267,54 @@ function Sync-Ruleset {
     }
 }
 
+function Test-ClassicProtection {
+    param([string]$Repo, [string[]]$Branches)
+
+    # Rulesets and classic branch protection are two independent layers and GitHub
+    # enforces the union of both. This script manages only rulesets, so classic
+    # protection is a second, invisible source of truth — and it has already deadlocked
+    # three main branches: an orphan required check nothing publishes, and
+    # require_code_owner_reviews on repositories with no CODEOWNERS on the default branch.
+    #
+    # Reported, never modified: removing branch protection is destructive and belongs to a
+    # human decision, not a nightly job.
+    foreach ($branch in $Branches) {
+        $raw = Invoke-GH -AllowFailure -Arguments @('api', "/repos/$Org/$Repo/branches/$branch/protection")
+        if (-not $raw) { continue }
+
+        $p = ($raw -join "`n") | ConvertFrom-Json
+        $problems = @()
+
+        $contexts = @()
+        if ($p.PSObject.Properties.Name -contains 'required_status_checks' -and $p.required_status_checks) {
+            $contexts = @($p.required_status_checks.contexts)
+        }
+        foreach ($c in $contexts) {
+            if ($c -ne 'ai-review') {
+                $problems += "requires status check '$c', which this lifecycle never publishes"
+            }
+        }
+
+        if ($p.PSObject.Properties.Name -contains 'required_pull_request_reviews' -and
+            $p.required_pull_request_reviews -and
+            $p.required_pull_request_reviews.require_code_owner_reviews) {
+
+            $hasCo = Invoke-GH -AllowFailure -Arguments @(
+                'api', "/repos/$Org/$Repo/contents/.github/CODEOWNERS?ref=$branch", '--jq', '.sha')
+            if (-not $hasCo) {
+                $problems += "requires code-owner review but $branch has no CODEOWNERS"
+            }
+        }
+
+        if ($problems.Count -gt 0) {
+            Write-Warn "classic branch protection on $branch $($problems -join '; '). It sits alongside the governance ruleset and GitHub enforces both, so this blocks every merge. Remove or repair it in Settings > Branches."
+        }
+        else {
+            Write-Warn "classic branch protection exists on $branch alongside the governance ruleset. Not managed by this script; prefer rulesets only."
+        }
+    }
+}
+
 function Sync-LegacyRulesets {
     param([string]$Repo)
 
@@ -435,6 +483,7 @@ foreach ($name in $repoNames) {
         }
 
         Sync-LegacyRulesets -Repo $name
+        Test-ClassicProtection -Repo $name -Branches @('main', 'develop', 'ai-driven1')
     }
     catch {
         Write-Host "  ERROR  $($_.Exception.Message)"
