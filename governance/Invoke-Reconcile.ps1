@@ -128,10 +128,18 @@ function New-RulesetBody {
         parameters = @{
             required_approving_review_count   = if ($isMain) { 1 } else { 0 }
             require_code_owner_review         = ($isMain -and $HasCodeowners)
-            require_last_push_approval        = $isMain
+            # Deliberately off. It forbids the person who made the last push from
+            # approving. With a single human code owner, any release where that person
+            # last pushed to develop becomes unapprovable — nobody else can satisfy it.
+            # Turn it on only once a second human joins PR Approvers.
+            require_last_push_approval        = $false
             dismiss_stale_reviews_on_push     = $true
             required_review_thread_resolution = $true
-            allowed_merge_methods             = @('squash')
+            # develop takes feature work: squash, so one pull request is one commit.
+            # main takes develop: a merge commit, never a squash. Squashing a long-lived
+            # branch into another long-lived branch leaves them with no shared history,
+            # so the next develop -> main release sees every past commit as new.
+            allowed_merge_methods             = if ($isMain) { @('merge') } else { @('squash') }
         }
     }
 
@@ -237,15 +245,19 @@ function Sync-RepositorySettings {
     if (-not $DryRun) {
         Invoke-GH -AllowFailure -Arguments @(
             'api', '-X', 'PATCH', "/repos/$Org/$Repo",
+            # Both are needed: squash for feature -> develop, merge commit for the
+            # develop -> main release. The per-branch ruleset decides which one applies.
             '-F', 'allow_squash_merge=true',
-            '-F', 'allow_merge_commit=false',
+            '-F', 'allow_merge_commit=true',
             '-F', 'allow_rebase_merge=false',
+            # Only deletes the head branch. develop and ai-driven1 carry a deletion rule,
+            # so this reaches feature branches only.
             '-F', 'delete_branch_on_merge=true',
             '-F', 'allow_auto_merge=true',
             '-F', 'has_issues=true'
         ) | Out-Null
     }
-    Write-Change 'apply repository settings (squash-only, delete branch on merge)'
+    Write-Change 'apply repository settings (squash + merge commit, delete feature branch on merge)'
 }
 
 function Sync-SecuritySettings {
