@@ -94,11 +94,29 @@ jobs:
           BASE: ${{ github.event.pull_request.base.ref }}
           HEAD: ${{ github.event.pull_request.head.ref }}
           AI_BRANCH: ${{ inputs.ai-branch }}
+          AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
         run: |
           $base = $env:BASE
           $head = $env:HEAD
           $ai   = $env:AI_BRANCH
           Write-Host "$head -> $base"
+
+          # Dependabot SECURITY updates always target the default branch and ignore
+          # target-branch in dependabot.yml — GitHub provides no setting for it. Closing
+          # them would silently stop every security fix from ever reaching the repository,
+          # so they are retargeted onto the promotion path instead of rejected.
+          #
+          # Matched on the numeric author id, never the branch name. A branch called
+          # dependabot/anything can be created by any identity with push access; user id
+          # 49699333 cannot be claimed. Verified against a live Dependabot pull request.
+          if ($base -eq 'main' -and $env:AUTHOR_ID -eq '49699333' -and $env:AUTHOR_TYPE -eq 'Bot') {
+              Write-Host 'Dependabot security update targeting main. Retargeting to develop.'
+              'retarget=true' >> $env:GITHUB_OUTPUT
+              'violation=' >> $env:GITHUB_OUTPUT
+              exit 0
+          }
+          'retarget=false' >> $env:GITHUB_OUTPUT
 
           $violation = switch ($base) {
               'main' {
@@ -123,6 +141,38 @@ jobs:
           }
           "violation=" >> $env:GITHUB_OUTPUT
           Write-Host 'Promotion path is valid.'
+
+      - name: Retarget a Dependabot security update onto develop
+        if: steps.validate.outputs.retarget == 'true'
+        uses: actions/create-github-app-token@v1
+        id: retarget-token
+        with:
+          app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
+          private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
+
+      - name: Move it to develop
+        if: steps.validate.outputs.retarget == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.retarget-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Closing these would silently stop every security fix from reaching the
+          # repository, because Dependabot ignores target-branch for security updates and
+          # always opens them against the default branch. Retargeting keeps exactly one
+          # path into main while letting the fix flow.
+          $body = @(
+              'Retargeted from `main` to `develop` automatically.'
+              ''
+              'Dependabot opens security updates against the default branch and ignores'
+              '`target-branch` for them, but `main` only accepts pull requests from'
+              '`develop`. This change now follows the promotion path and will reach'
+              '`main` with the next release.'
+          ) -join "`n"
+
+          gh api -X POST "/repos/$env:REPO/issues/$env:PR_NUMBER/comments" -f "body=$body" | Out-Null
+          gh api -X PATCH "/repos/$env:REPO/pulls/$env:PR_NUMBER" -f base='develop' --jq '"base is now " + .base.ref'
 
       # A failing check is not enough on its own. Check runs are keyed by commit, not by
       # pull request, so one commit that is the head of two pull requests has ONE
