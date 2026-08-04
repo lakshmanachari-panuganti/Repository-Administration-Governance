@@ -20,11 +20,8 @@
     "Test-Repo": {
       "enableAgents": true
     },
-    "PowerShell": {
-      "language": "powershell"
-    },
-    "UserStory-Implementation": {},
     "PhotoSheet-Maker": {},
+    "PrintMyID": {},
     "navya-cloud-kitchen": {},
     "OMG.PSUtilities": {
       "language": "powershell",
