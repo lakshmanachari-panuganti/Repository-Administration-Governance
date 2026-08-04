@@ -159,8 +159,18 @@ function New-RulesetBody {
         $rules += @{
             type = 'required_status_checks'
             parameters = @{
-                # "Require branches to be up to date before merging."
-                strict_required_status_checks_policy = $true
+                # "Require branches to be up to date before merging" — but never on main.
+                #
+                # Merging develop into main with a merge commit leaves main holding a
+                # commit develop does not have. Under a strict policy the next release
+                # pull request is then "behind" and must update develop first, which is
+                # itself a protected branch requiring a pull request, and the promotion
+                # path forbids main -> develop. Every release after the first deadlocks.
+                #
+                # On develop the rule is worth having: it forces feature work to be tested
+                # against the current base. main only ever receives from develop, so there
+                # is nothing for it to be stale against.
+                strict_required_status_checks_policy = ($Branch -ne 'main')
                 required_status_checks               = $checks
             }
         }
