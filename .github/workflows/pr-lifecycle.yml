@@ -475,24 +475,51 @@ jobs:
   auto-merge:
     name: Arm auto-merge
     needs: verdict
-    # needs.verdict.outputs.conclusion, NOT needs.verdict.result. The verdict job
-    # succeeds whenever it manages to publish a check — including when the check it
+    # The job runs on every pull request into develop and decides inside itself.
+    #
+    # The gate is needs.verdict.outputs.conclusion, NOT needs.verdict.result: the verdict
+    # job succeeds whenever it manages to publish a check, including when the check it
     # publishes is a failure. Testing the job result armed auto-merge on guard failures,
-    # which would merge them outright in any repository where ai-review is not yet a
-    # required check.
+    # which merges them outright in any repository where ai-review is not yet required.
+    #
+    # That gate is evaluated in a step rather than in this job-level `if` because a job
+    # `if` referencing needs.<job>.outputs silently evaluated false and skipped the job
+    # even when the verdict was success. Deciding in a step makes the value observable
+    # in the log instead of failing invisibly.
     if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.base.ref == 'develop' &&
-      needs.verdict.outputs.conclusion == 'success'
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'develop'
     runs-on: ubuntu-latest
     steps:
+      - name: Should auto-merge be armed?
+        id: gate
+        shell: pwsh
+        env:
+          VERDICT_RESULT: ${{ needs.verdict.result }}
+          VERDICT_CONCLUSION: ${{ needs.verdict.outputs.conclusion }}
+        run: |
+          Write-Host "verdict job result : '$env:VERDICT_RESULT'"
+          Write-Host "verdict conclusion : '$env:VERDICT_CONCLUSION'"
+
+          # Fail closed: anything other than an explicit success leaves auto-merge off.
+          if ($env:VERDICT_CONCLUSION -eq 'success') {
+              'go=true' >> $env:GITHUB_OUTPUT
+              Write-Host 'Arming auto-merge.'
+          }
+          else {
+              'go=false' >> $env:GITHUB_OUTPUT
+              Write-Host 'Not arming auto-merge.'
+          }
+
       - uses: actions/create-github-app-token@v1
         id: developer-token
+        if: steps.gate.outputs.go == 'true'
         with:
           app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
           private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
 
       - name: Enable auto-merge
+        if: steps.gate.outputs.go == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.developer-token.outputs.token }}
@@ -503,6 +530,7 @@ jobs:
           gh pr merge $env:PR_URL --squash --auto
 
       - name: Update branch if behind
+        if: steps.gate.outputs.go == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.developer-token.outputs.token }}
