@@ -487,8 +487,17 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL || 'opus' }}
         run: |
+          # --allowedTools is required. Without it every gh call is refused by the CLI's
+          # permission prompt in a non-interactive runner, and the agent completes having
+          # posted nothing: the first real run reviewed the code correctly, found the
+          # planted defect, and then could not submit a single comment.
+          #
+          # gh is safe to allow here because the credential bounds it: GH_TOKEN is the
+          # Reviewer App's installation token, which holds contents:read. It can comment
+          # and publish checks; it cannot push, whatever it is persuaded to attempt.
           claude --model "$REVIEWER_MODEL" \
                  --agents pr-reviewer \
+                 --allowedTools "Bash(gh:*),Read,Grep,Glob" \
                  --output-format json \
                  -p "Review pull request #${PR_NUMBER} using the pr-reviewer subagent. On rounds after the first, review both the updated code and the developer's replies to your earlier comments. Approve by submitting an APPROVE review, or request changes with specific, actionable comments." \
                  | tee review-result.json
@@ -575,8 +584,13 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           DEVELOPER_MODEL: ${{ vars.DEVELOPER_MODEL || 'sonnet' }}
         run: |
+          # Same reason as the reviewer. The developer additionally needs Edit/Write to
+          # implement fixes and git to commit them. Its token is the Developer App's, which
+          # holds contents:write - the guard, not the tool list, is what stops it touching
+          # .github/, infra/, package.json and the other paths CI executes with credentials.
           claude --model "$DEVELOPER_MODEL" \
                  --agents pr-developer \
+                 --allowedTools "Bash(gh:*),Bash(git:*),Bash(npm:*),Read,Edit,Write,Grep,Glob" \
                  --output-format json \
                  -p "Address the open review comments on pull request #${PR_NUMBER} using the pr-developer subagent. Fix what is valid; rebut false positives with technical evidence. Do not modify anything under .github/workflows — the guard rejects it." \
                  | tee respond-result.json
