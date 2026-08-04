@@ -47,6 +47,9 @@ concurrency:
 
 permissions:
   contents: read
+  # Read-only, and only so the auto-merge gate can read labels live rather than from the
+  # frozen event payload. Every write to a pull request goes through an App token.
+  pull-requests: read
 
 env:
   ADMIN_REPO: lakshmanachari-panuganti/Repository-Administration-Governance
@@ -542,10 +545,19 @@ jobs:
           VERDICT_RESULT: ${{ needs.verdict.result }}
           VERDICT_CONCLUSION: ${{ needs.verdict.outputs.conclusion }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           Write-Host "verdict job result : '$env:VERDICT_RESULT'"
           Write-Host "verdict conclusion : '$env:VERDICT_CONCLUSION'"
+
+          # Read labels live, NOT from github.event.pull_request.labels. The payload is
+          # frozen at the moment the event fired, so a needs-human label added seconds
+          # after `opened` is invisible to this run — verified: a labelled pull request
+          # merged itself 52 seconds after being labelled.
+          $labels = @(gh api "/repos/$env:REPO/issues/$env:PR_NUMBER/labels" --jq '.[].name')
+          Write-Host "labels (live)      : $($labels -join ', ')"
 
           $reasons = @()
           # Fail closed: anything other than an explicit success leaves auto-merge off.
@@ -556,7 +568,7 @@ jobs:
 
           # needs-human means a person should look at this. Stopping the agents but still
           # merging it automatically defeats the entire point of the label.
-          if (($env:LABELS -split ',') -contains 'needs-human') { $reasons += 'needs-human label' }
+          if ($labels -contains 'needs-human') { $reasons += 'needs-human label' }
 
           if ($reasons.Count -gt 0) {
               'go=false' >> $env:GITHUB_OUTPUT
@@ -569,10 +581,24 @@ jobs:
 
       - uses: actions/create-github-app-token@v1
         id: developer-token
-        if: steps.gate.outputs.go == 'true'
         with:
           app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
           private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
+
+      # Arming is not the only state that matters. If auto-merge was armed by an earlier
+      # run and the pull request has since been labelled needs-human or turned back into
+      # a draft, leaving it armed means it still merges itself. Disarm explicitly.
+      - name: Disarm auto-merge
+        if: steps.gate.outputs.go != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.developer-token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          ALREADY_ARMED: ${{ github.event.pull_request.auto_merge != null }}
+        run: |
+          if ($env:ALREADY_ARMED -ne 'true') { Write-Host 'Auto-merge was not armed.'; exit 0 }
+          Write-Host 'Auto-merge is armed but should not be. Disabling.'
+          gh pr merge $env:PR_URL --disable-auto
 
       - name: Enable auto-merge
         if: steps.gate.outputs.go == 'true'
