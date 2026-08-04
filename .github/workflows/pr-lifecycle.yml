@@ -57,7 +57,13 @@ on:
         default: '.github/*,.github/**,infra/*,infra/**,package.json,**/package.json,package-lock.json,**/package-lock.json,next.config.*,**/next.config.*,*.psd1,**/*.psd1'
 
 concurrency:
-  group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}
+  # Keyed by event type as well as pull request. Sharing one group across both events
+  # deadlocked a pull request permanently: the reviewer submitted five reviews, each
+  # queued a pull_request_review run in the same group, and GitHub evicts an older queued
+  # run when a newer one arrives. The pull_request run that publishes ai-review was
+  # cancelled before it started, so the required check never appeared on the fixed commit
+  # and nothing could ever unblock it.
+  group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ github.event_name }}
   cancel-in-progress: false
 
 # Left at contents: read. The organisation's default workflow permission is "read", and a
