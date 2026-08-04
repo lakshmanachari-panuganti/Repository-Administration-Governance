@@ -40,6 +40,13 @@ on:
         description: 'Reviewer rounds before handing over to a human.'
         type: number
         default: 5
+      agent-protected-paths:
+        description: >-
+          Comma-separated wildcard patterns the AI branch may not modify. These are the files
+          CI executes with credentials, not merely sensitive ones. Extend per repository;
+          do not narrow without deciding what runs the removed path.
+        type: string
+        default: '.github/*,.github/**,infra/*,infra/**,package.json,**/package.json,package-lock.json,**/package-lock.json,next.config.*,**/next.config.*,*.psd1,**/*.psd1'
 
 concurrency:
   group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}
@@ -213,6 +220,7 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           AI_BRANCH: ${{ inputs.ai-branch }}
+          AGENT_PROTECTED_PATHS: ${{ inputs.agent-protected-paths }}
         run: |
           $ErrorActionPreference = 'Stop'
           $failed = @()
@@ -240,8 +248,22 @@ jobs:
               # review, and forbidding it outright blocks the very pull request that
               # onboards a repository onto this workflow.
               if ($env:HEAD_REF -eq $env:AI_BRANCH) {
-                  $ci = $files | Where-Object { $_ -like '.github/workflows/*' }
-                  if ($ci) { $failed += "agent branch modified workflow files: $($ci -join ', ')" }
+                  # Withholding workflows:write from the Developer App stops it editing
+                  # .github/workflows, but not the other files that CI executes with
+                  # credentials: package.json scripts run on every npm ci, infra/** carries
+                  # the deployment definitions, and next.config.* runs at build time. Those
+                  # jobs hold Azure OIDC, so an agent editing any of them reaches production
+                  # without ever touching a workflow file.
+                  #
+                  # GitHub Free has no per-path ruleset restriction, so it has to live here.
+                  $protected = @($env:AGENT_PROTECTED_PATHS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                  $touched = $files | Where-Object {
+                      $file = $_
+                      $protected | Where-Object { $file -like $_ }
+                  }
+                  if ($touched) {
+                      $failed += "agent branch touched protected paths: $($touched -join ', ')"
+                  }
               }
           }
           else {
