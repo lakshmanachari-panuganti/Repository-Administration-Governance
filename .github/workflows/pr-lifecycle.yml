@@ -485,3 +485,28 @@ jobs:
           # Native auto-merge: GitHub merges when every required check passes. It does not
           # bypass a single rule — if ai-review fails, the pull request simply waits.
           gh pr merge $env:PR_URL --squash --auto
+
+      - name: Update branch if behind
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.developer-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # "Require branches to be up to date before merging" leaves a stale pull request
+          # sitting at mergeable_state=behind indefinitely — auto-merge waits but GitHub
+          # never updates the branch on its own. Without this the automated path silently
+          # stops being automated.
+          $state = gh api "/repos/$env:REPO/pulls/$env:PR_NUMBER" --jq '.mergeable_state'
+          Write-Host "mergeable_state: $state"
+          if ($state -ne 'behind') { Write-Host 'Branch is current.'; exit 0 }
+
+          # Merges the base into the head. The resulting push re-runs this workflow, which
+          # republishes ai-review against the new head and lets auto-merge complete.
+          $result = gh api -X PUT "/repos/$env:REPO/pulls/$env:PR_NUMBER/update-branch" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::Could not update the branch automatically: $result"
+              Write-Host '::warning::This usually means a merge conflict. A human needs to resolve it.'
+              exit 0
+          }
+          Write-Host 'Branch updated; a fresh run will publish the verdict.'
