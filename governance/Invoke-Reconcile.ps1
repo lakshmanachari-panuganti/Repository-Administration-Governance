@@ -70,9 +70,18 @@ function Invoke-GH {
     return $out
 }
 
+function Test-HasProperty {
+    param($Object, [string]$Name)
+    # Not `$Object.PSObject.Properties.Name -contains $Name`: under Set-StrictMode the
+    # member enumeration of .Name throws on an object with no properties, which is
+    # exactly what a repository configured as {} produces.
+    if ($null -eq $Object) { return $false }
+    return [bool]($Object.PSObject.Properties | Where-Object { $_.Name -eq $Name })
+}
+
 function Get-RepoSetting {
     param($RepoConfig, [string]$Key)
-    if ($RepoConfig.PSObject.Properties.Name -contains $Key) { return $RepoConfig.$Key }
+    if (Test-HasProperty $RepoConfig $Key) { return $RepoConfig.$Key }
     return $config.defaults.$Key
 }
 
@@ -81,7 +90,14 @@ function Get-RepoSetting {
 function New-RulesetBody {
     param(
         [ValidateSet('main', 'develop', 'ai-driven1')][string]$Branch,
-        [string[]]$ExtraChecks = @()
+        [string[]]$ExtraChecks = @(),
+        # require_code_owner_review with no CODEOWNERS file is a rule nothing can ever
+        # satisfy — it deadlocks main permanently. Only ask for it once the file exists;
+        # the next reconcile run adds it automatically.
+        [bool]$HasCodeowners = $false,
+        # Same hazard: requiring ai-review in a repository that has not adopted the
+        # lifecycle workflow means no job can ever publish that check.
+        [bool]$HasLifecycle = $false
     )
 
     $rules = @(
@@ -111,7 +127,7 @@ function New-RulesetBody {
         type = 'pull_request'
         parameters = @{
             required_approving_review_count   = if ($isMain) { 1 } else { 0 }
-            require_code_owner_review         = $isMain
+            require_code_owner_review         = ($isMain -and $HasCodeowners)
             require_last_push_approval        = $isMain
             dismiss_stale_reviews_on_push     = $true
             required_review_thread_resolution = $true
@@ -119,15 +135,20 @@ function New-RulesetBody {
         }
     }
 
-    $checks = @(@{ context = 'ai-review'; integration_id = [int]$ReviewerAppId })
+    $checks = @()
+    if ($HasLifecycle) {
+        $checks += @{ context = 'ai-review'; integration_id = [int]$ReviewerAppId }
+    }
     foreach ($c in $ExtraChecks) { $checks += @{ context = $c } }
 
-    $rules += @{
-        type = 'required_status_checks'
-        parameters = @{
-            # "Require branches to be up to date before merging."
-            strict_required_status_checks_policy = $true
-            required_status_checks               = $checks
+    if ($checks.Count -gt 0) {
+        $rules += @{
+            type = 'required_status_checks'
+            parameters = @{
+                # "Require branches to be up to date before merging."
+                strict_required_status_checks_policy = $true
+                required_status_checks               = $checks
+            }
         }
     }
 
@@ -272,12 +293,31 @@ function Sync-Codeowners {
         'api', "/repos/$Org/$Repo/contents/.github/CODEOWNERS?ref=$DefaultBranch", '--jq', '.content'
     )
 
-    if ($current) {
-        $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($current -join '').Replace("`n", '')))
-        if ($decoded.Trim() -eq $desired.Trim()) { return }
+    if ($current) { return $true }
+
+    if ($DryRun) {
+        Write-Change 'create .github/CODEOWNERS'
+        return $false
     }
 
-    Write-Warn "CODEOWNERS missing or stale on $Repo. main will block until it exists. Commit it via a pull request — this script does not push to protected branches."
+    # Attempt to seed it. This succeeds on a repository whose default branch is not yet
+    # protected — which is the case on first onboarding, when it matters. Once main is
+    # protected the write is refused, and the file must arrive by pull request.
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($desired + "`n"))
+    $result = Invoke-GH -AllowFailure -Arguments @(
+        'api', '-X', 'PUT', "/repos/$Org/$Repo/contents/.github/CODEOWNERS",
+        '-f', 'message=chore: add CODEOWNERS (governance)',
+        '-f', "content=$encoded",
+        '-f', "branch=$DefaultBranch"
+    )
+
+    if ($result) {
+        Write-Change 'create .github/CODEOWNERS'
+        return $true
+    }
+
+    Write-Warn "CODEOWNERS is missing on $Repo and could not be written (the default branch is protected). Commit it by pull request. Until then main will not require code-owner review, so a bot could merge to production."
+    return $false
 }
 
 # ------------------------------------------------------------------------ driver
@@ -297,17 +337,20 @@ foreach ($name in $repoNames) {
     $repoConfig = $config.repositories.$name
 
     try {
-        $repo = Invoke-GH -AllowFailure -Arguments @('api', "/repos/$Org/$name", '--jq', '{default_branch,size}')
+        $repo = Invoke-GH -AllowFailure -Arguments @('api', "/repos/$Org/$name", '--jq', '.default_branch')
         if (-not $repo) { Write-Warn 'repository not found — skipping'; continue }
-        $repoInfo = $repo | ConvertFrom-Json
+        $defaultBranch = "$repo".Trim()
 
-        if ($repoInfo.size -eq 0) {
-            Write-Warn 'repository is empty; branches and rulesets cannot be applied yet'
+        # Do not test the `size` field for emptiness — it is in KB and updates lazily, so
+        # a small but populated repository reports 0. Absence of the default branch ref
+        # is the reliable signal.
+        $baseSha = Invoke-GH -AllowFailure -Arguments @(
+            'api', "/repos/$Org/$name/git/refs/heads/$defaultBranch", '--jq', '.object.sha')
+        if (-not $baseSha) {
+            Write-Warn "no commits on $defaultBranch; branches and rulesets cannot be applied yet"
             continue
         }
-
-        $defaultBranch = $repoInfo.default_branch
-        $baseSha = Invoke-GH -Arguments @('api', "/repos/$Org/$name/git/refs/heads/$defaultBranch", '--jq', '.object.sha')
+        $baseSha = "$baseSha".Trim()
 
         foreach ($branch in (Get-RepoSetting $repoConfig 'branches')) {
             Sync-Branch -Repo $name -Branch $branch -BaseSha $baseSha
@@ -315,15 +358,22 @@ foreach ($name in $repoNames) {
 
         Sync-RepositorySettings -Repo $name
         Sync-SecuritySettings   -Repo $name
-        Sync-Codeowners         -Repo $name -DefaultBranch $defaultBranch
+        $hasCodeowners = Sync-Codeowners -Repo $name -DefaultBranch $defaultBranch
+
+        $hasLifecycle = [bool](Invoke-GH -AllowFailure -Arguments @(
+            'api', "/repos/$Org/$name/contents/.github/workflows/pr-lifecycle.yml?ref=$defaultBranch", '--jq', '.sha'))
+        if (-not $hasLifecycle) {
+            Write-Warn "$name has not adopted .github/workflows/pr-lifecycle.yml. The ai-review gate is left off until it does — requiring a check nothing can publish would block the branch permanently."
+        }
 
         $extra = Get-RepoSetting $repoConfig 'extraRequiredChecks'
         foreach ($branch in @('ai-driven1', 'develop', 'main')) {
             $checks = @()
-            if ($branch -ne 'ai-driven1' -and $extra.PSObject.Properties.Name -contains $branch) {
+            if ($branch -ne 'ai-driven1' -and (Test-HasProperty $extra $branch)) {
                 $checks = @($extra.$branch)
             }
-            Sync-Ruleset -Repo $name -Body (New-RulesetBody -Branch $branch -ExtraChecks $checks)
+            Sync-Ruleset -Repo $name -Body (New-RulesetBody -Branch $branch -ExtraChecks $checks `
+                -HasCodeowners $hasCodeowners -HasLifecycle $hasLifecycle)
         }
 
         Sync-LegacyRulesets -Repo $name
