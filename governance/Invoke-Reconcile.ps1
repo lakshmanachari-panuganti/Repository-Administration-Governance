@@ -414,12 +414,23 @@ function Sync-Codeowners {
         # or a login that no longer exists, parses to zero owners: GitHub then treats
         # require_code_owner_review as satisfied by any approver, so the human gate is off
         # while this script reports the repository as fully governed.
+        # Fully qualified ref. The short name resolves inconsistently: ?ref=main returned
+        # 404 on one repository while ?ref=refs/heads/main returned results on the same
+        # commit.
+        $qualified = "refs/heads/$DefaultBranch"
         $errors = Invoke-GH -AllowFailure -Arguments @(
-            'api', "/repos/$Org/$Repo/codeowners/errors?ref=$DefaultBranch", '--jq', '.errors | length')
+            'api', "/repos/$Org/$Repo/codeowners/errors?ref=$qualified", '--jq', '.errors | length')
 
-        if ($null -ne $errors -and [int]("$errors".Trim()) -gt 0) {
+        if ($null -eq $errors) {
+            # Fail closed. Treating an unanswerable validation as success is how a gate
+            # ends up reported as active while granting ownership to nobody.
+            Write-Warn "could not validate CODEOWNERS on $DefaultBranch (the errors endpoint did not respond). Code-owner review is left OFF rather than enabled on an unverified file."
+            return $false
+        }
+
+        if ([int]("$errors".Trim()) -gt 0) {
             $detail = Invoke-GH -AllowFailure -Arguments @(
-                'api', "/repos/$Org/$Repo/codeowners/errors?ref=$DefaultBranch",
+                'api', "/repos/$Org/$Repo/codeowners/errors?ref=$qualified",
                 '--jq', '[.errors[] | "line \(.line): \(.message)"] | join("; ")')
             Write-Warn "CODEOWNERS on $DefaultBranch is present but invalid ($detail). Code-owner review will NOT be required until it parses, because an unparseable file grants ownership to nobody."
             return $false
