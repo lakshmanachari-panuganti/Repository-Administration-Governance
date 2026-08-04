@@ -65,6 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate promotion path
+        id: validate
         shell: pwsh
         env:
           BASE: ${{ github.event.pull_request.base.ref }}
@@ -94,9 +95,52 @@ jobs:
 
           if ($violation) {
               Write-Host "::error::$violation"
+              "violation=$violation" >> $env:GITHUB_OUTPUT
               exit 1
           }
+          "violation=" >> $env:GITHUB_OUTPUT
           Write-Host 'Promotion path is valid.'
+
+      # A failing check is not enough on its own. Check runs are keyed by commit, not by
+      # pull request, so one commit that is the head of two pull requests has ONE
+      # ai-review check between them. Opening ai-driven1 -> develop and ai-driven1 -> main
+      # from the same commit lets the main-targeted pull request inherit the green verdict
+      # published for the develop-targeted one — verified, the illegal pull request showed
+      # ai-review: success.
+      #
+      # Closing the pull request removes it rather than relying on a check that a sibling
+      # can overwrite.
+      - name: Close a pull request that breaks the promotion path
+        if: failure()
+        uses: actions/create-github-app-token@v1
+        id: reviewer-token
+        with:
+          app-id: ${{ vars.AI_REVIEWER_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEWER_APP_KEY }}
+
+      - name: Close it
+        if: failure() && steps.reviewer-token.outputs.token != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VIOLATION: ${{ steps.validate.outputs.violation }}
+        run: |
+          $body = @(
+              'This pull request does not follow the promotion path and has been closed automatically.'
+              ''
+              "> $env:VIOLATION"
+              ''
+              '```'
+              'feature ──> ai-driven1 ──> develop ──> main'
+              '```'
+              ''
+              'Open it against the correct base branch instead.'
+          ) -join "`n"
+
+          gh api -X POST "/repos/$env:REPO/issues/$env:PR_NUMBER/comments" -f "body=$body" | Out-Null
+          gh api -X PATCH "/repos/$env:REPO/pulls/$env:PR_NUMBER" -f state='closed' --jq '.state'
 
   # ------------------------------------------------------------------ eligibility
   eligibility:
@@ -497,18 +541,30 @@ jobs:
         env:
           VERDICT_RESULT: ${{ needs.verdict.result }}
           VERDICT_CONCLUSION: ${{ needs.verdict.outputs.conclusion }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           Write-Host "verdict job result : '$env:VERDICT_RESULT'"
           Write-Host "verdict conclusion : '$env:VERDICT_CONCLUSION'"
 
+          $reasons = @()
           # Fail closed: anything other than an explicit success leaves auto-merge off.
-          if ($env:VERDICT_CONCLUSION -eq 'success') {
-              'go=true' >> $env:GITHUB_OUTPUT
-              Write-Host 'Arming auto-merge.'
+          if ($env:VERDICT_CONCLUSION -ne 'success') { $reasons += "verdict is '$env:VERDICT_CONCLUSION'" }
+
+          # gh pr merge --auto errors outright on a draft, failing the run for no reason.
+          if ($env:IS_DRAFT -eq 'true') { $reasons += 'pull request is a draft' }
+
+          # needs-human means a person should look at this. Stopping the agents but still
+          # merging it automatically defeats the entire point of the label.
+          if (($env:LABELS -split ',') -contains 'needs-human') { $reasons += 'needs-human label' }
+
+          if ($reasons.Count -gt 0) {
+              'go=false' >> $env:GITHUB_OUTPUT
+              Write-Host "Not arming auto-merge: $($reasons -join '; ')"
           }
           else {
-              'go=false' >> $env:GITHUB_OUTPUT
-              Write-Host 'Not arming auto-merge.'
+              'go=true' >> $env:GITHUB_OUTPUT
+              Write-Host 'Arming auto-merge.'
           }
 
       - uses: actions/create-github-app-token@v1
