@@ -40,6 +40,14 @@ on:
         description: 'Reviewer rounds before handing over to a human.'
         type: number
         default: 5
+      agent-logins:
+        description: >-
+          Comma-separated logins treated as agents. Both spellings are included on purpose:
+          webhook payloads use "<slug>[bot]" while `gh pr view --json author` returns
+          "app/<slug>", and matching only one silently classifies every agent pull request
+          as human.
+        type: string
+        default: 'lakshmanachari-panuganti[bot],app/lakshmanachari-panuganti,devils-advocate-review[bot],app/devils-advocate-review,omg-ai-developer,devilsadvocate-reviewer'
       agent-protected-paths:
         description: >-
           Comma-separated wildcard patterns the AI branch may not modify. These are the files
@@ -221,6 +229,8 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           AI_BRANCH: ${{ inputs.ai-branch }}
           AGENT_PROTECTED_PATHS: ${{ inputs.agent-protected-paths }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          AGENT_LOGINS: ${{ inputs.agent-logins }}
         run: |
           $ErrorActionPreference = 'Stop'
           $failed = @()
@@ -247,7 +257,19 @@ jobs:
               # branch on purpose: a human changing CI is ordinary work that goes through
               # review, and forbidding it outright blocks the very pull request that
               # onboards a repository onto this workflow.
-              if ($env:HEAD_REF -eq $env:AI_BRANCH) {
+              # Scoped by AUTHOR, not by branch. Branch names are chosen by whoever pushes,
+              # so an agent that opened a pull request from feature/x rather than the AI
+              # branch would previously have skipped this check entirely. The author
+              # identity cannot be chosen.
+              #
+              # github.event.pull_request.user.login is the "<slug>[bot]" spelling. Note it
+              # differs from `gh pr view --json author`, which returns "app/<slug>" — both
+              # are matched here so the list stays correct wherever it is reused.
+              $agentLogins = @($env:AGENT_LOGINS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              $isAgentAuthored = [bool](@($agentLogins | Where-Object { $_ -eq $env:PR_AUTHOR }).Count)
+              Write-Host "author: $env:PR_AUTHOR (agent-authored: $isAgentAuthored)"
+
+              if ($isAgentAuthored) {
                   # Withholding workflows:write from the Developer App stops it editing
                   # .github/workflows, but not the other files that CI executes with
                   # credentials: package.json scripts run on every npm ci, infra/** carries
