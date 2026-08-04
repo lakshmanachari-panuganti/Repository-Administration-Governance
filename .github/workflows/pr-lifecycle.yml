@@ -45,11 +45,12 @@ concurrency:
   group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
+# Left at contents: read. The organisation's default workflow permission is "read", and a
+# reusable workflow cannot request more than its caller holds — adding pull-requests: read
+# here failed every run with startup_failure before any job began. Anything needing more
+# than contents uses an App token.
 permissions:
   contents: read
-  # Read-only, and only so the auto-merge gate can read labels live rather than from the
-  # frozen event payload. Every write to a pull request goes through an App token.
-  pull-requests: read
 
 env:
   ADMIN_REPO: lakshmanachari-panuganti/Repository-Administration-Governance
@@ -538,6 +539,12 @@ jobs:
       github.event.pull_request.base.ref == 'develop'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/create-github-app-token@v1
+        id: developer-token
+        with:
+          app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
+          private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
+
       - name: Should auto-merge be armed?
         id: gate
         shell: pwsh
@@ -547,7 +554,7 @@ jobs:
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.developer-token.outputs.token }}
         run: |
           Write-Host "verdict job result : '$env:VERDICT_RESULT'"
           Write-Host "verdict conclusion : '$env:VERDICT_CONCLUSION'"
@@ -578,12 +585,6 @@ jobs:
               'go=true' >> $env:GITHUB_OUTPUT
               Write-Host 'Arming auto-merge.'
           }
-
-      - uses: actions/create-github-app-token@v1
-        id: developer-token
-        with:
-          app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
-          private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
 
       # Arming is not the only state that matters. If auto-merge was armed by an earlier
       # run and the pull request has since been labelled needs-human or turned back into
