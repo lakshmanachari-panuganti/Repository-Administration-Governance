@@ -157,6 +157,8 @@ jobs:
           MAX_FILES: ${{ inputs.max-changed-files }}
           MAX_LINES: ${{ inputs.max-changed-lines }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          AI_BRANCH: ${{ inputs.ai-branch }}
         run: |
           $ErrorActionPreference = 'Stop'
           $failed = @()
@@ -179,9 +181,14 @@ jobs:
                   $failed += "$($ins + $del) lines changed, limit is $env:MAX_LINES"
               }
 
-              # The agents must not rewrite the CI that constrains them.
-              $ci = $files | Where-Object { $_ -like '.github/workflows/*' }
-              if ($ci) { $failed += "workflow files modified: $($ci -join ', ')" }
+              # The agents must not rewrite the CI that constrains them. Scoped to the AI
+              # branch on purpose: a human changing CI is ordinary work that goes through
+              # review, and forbidding it outright blocks the very pull request that
+              # onboards a repository onto this workflow.
+              if ($env:HEAD_REF -eq $env:AI_BRANCH) {
+                  $ci = $files | Where-Object { $_ -like '.github/workflows/*' }
+                  if ($ci) { $failed += "agent branch modified workflow files: $($ci -join ', ')" }
+              }
           }
           else {
               Write-Host 'Promotion to main: size and workflow limits do not apply.'
@@ -401,6 +408,8 @@ jobs:
     needs: [eligibility, flow, guard, review]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    outputs:
+      conclusion: ${{ steps.publish.outputs.conclusion }}
     steps:
       - uses: actions/create-github-app-token@v1
         id: reviewer-token
@@ -409,6 +418,7 @@ jobs:
           private-key: ${{ secrets.AI_REVIEWER_APP_KEY }}
 
       - name: Publish check run
+        id: publish
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
@@ -450,6 +460,7 @@ jobs:
           }
 
           Write-Host "ai-review -> $conclusion ($title)"
+          "conclusion=$conclusion" >> $env:GITHUB_OUTPUT
           gh api -X POST "/repos/$env:REPO/check-runs" `
                  -f name='ai-review' `
                  -f head_sha="$env:HEAD_SHA" `
@@ -464,10 +475,15 @@ jobs:
   auto-merge:
     name: Arm auto-merge
     needs: verdict
+    # needs.verdict.outputs.conclusion, NOT needs.verdict.result. The verdict job
+    # succeeds whenever it manages to publish a check — including when the check it
+    # publishes is a failure. Testing the job result armed auto-merge on guard failures,
+    # which would merge them outright in any repository where ai-review is not yet a
+    # required check.
     if: >-
-      always() && github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request' &&
       github.event.pull_request.base.ref == 'develop' &&
-      needs.verdict.result == 'success'
+      needs.verdict.outputs.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v1
