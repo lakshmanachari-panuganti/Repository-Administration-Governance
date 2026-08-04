@@ -123,6 +123,12 @@ function New-RulesetBody {
     # develop is check-gated: the reviewer App's verdict is the approval.
     $isMain = $Branch -eq 'main'
 
+    # Assigned before the hashtable, not inline. Returning @('squash') from an if
+    # expression unwraps the single-element array to a scalar, and the ruleset API
+    # rejects a string where it expects a list.
+    $mergeMethods = @('squash')
+    if ($isMain) { $mergeMethods = @('merge') }
+
     $rules += @{
         type = 'pull_request'
         parameters = @{
@@ -139,7 +145,7 @@ function New-RulesetBody {
             # main takes develop: a merge commit, never a squash. Squashing a long-lived
             # branch into another long-lived branch leaves them with no shared history,
             # so the next develop -> main release sees every past commit as new.
-            allowed_merge_methods             = if ($isMain) { @('merge') } else { @('squash') }
+            allowed_merge_methods             = $mergeMethods
         }
     }
 
@@ -173,6 +179,36 @@ function New-RulesetBody {
 
 # ------------------------------------------------------------------- reconcilers
 
+function Test-LifecycleAdopted {
+    param([string]$Repo, [string]$DefaultBranch)
+
+    # A repository has adopted the lifecycle only if one of its workflows *calls* the
+    # reusable one. Testing for a file named pr-lifecycle.yml is not the same thing:
+    # this administration repository contains that file as the reusable workflow itself
+    # (on: workflow_call), which never runs on a pull request. Treating it as adopted
+    # required ai-review on a branch where nothing could ever publish it, and deadlocked
+    # main here until the check was removed.
+    $listing = Invoke-GH -AllowFailure -Arguments @(
+        'api', "/repos/$Org/$Repo/contents/.github/workflows?ref=$DefaultBranch", '--jq', '.[].name')
+    if (-not $listing) { return $false }
+
+    foreach ($file in @($listing)) {
+        $file = "$file".Trim()
+        if ($file -notmatch '\.ya?ml$') { continue }
+
+        $encoded = Invoke-GH -AllowFailure -Arguments @(
+            'api', "/repos/$Org/$Repo/contents/.github/workflows/$file`?ref=$DefaultBranch", '--jq', '.content')
+        if (-not $encoded) { continue }
+
+        $text = [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String((($encoded -join '') -replace '\s', '')))
+
+        # `uses: .../pr-lifecycle.yml@ref` — the caller reference.
+        if ($text -match 'pr-lifecycle\.ya?ml@') { return $true }
+    }
+    return $false
+}
+
 function Sync-Branch {
     param([string]$Repo, [string]$Branch, [string]$BaseSha)
 
@@ -195,6 +231,7 @@ function Sync-Ruleset {
     $match    = @($existing | Where-Object { $_.name -eq $Body.name })
 
     $json = $Body | ConvertTo-Json -Depth 20
+    if ($env:GOVERNANCE_DEBUG) { Write-Host "---- $($Body.name) ----`n$json`n----" }
     $tmp  = New-TemporaryFile
     Set-Content -Path $tmp -Value $json -Encoding utf8
 
@@ -372,8 +409,7 @@ foreach ($name in $repoNames) {
         Sync-SecuritySettings   -Repo $name
         $hasCodeowners = Sync-Codeowners -Repo $name -DefaultBranch $defaultBranch
 
-        $hasLifecycle = [bool](Invoke-GH -AllowFailure -Arguments @(
-            'api', "/repos/$Org/$name/contents/.github/workflows/pr-lifecycle.yml?ref=$defaultBranch", '--jq', '.sha'))
+        $hasLifecycle = Test-LifecycleAdopted -Repo $name -DefaultBranch $defaultBranch
         if (-not $hasLifecycle) {
             Write-Warn "$name has not adopted .github/workflows/pr-lifecycle.yml. The ai-review gate is left off until it does — requiring a check nothing can publish would block the branch permanently."
         }
