@@ -1,0 +1,4 @@
+# main requires code-owner approval. GitHub Apps cannot be code owners, which is what
+# prevents any bot from merging to production.
+
+* @lakshmanachari-panuganti-lab

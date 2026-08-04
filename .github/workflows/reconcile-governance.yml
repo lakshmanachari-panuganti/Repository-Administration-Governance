@@ -1,0 +1,66 @@
+name: Reconcile Governance
+
+# Applies governance/repositories.json to every repository in the organisation.
+#
+# Scheduled reconciliation rather than a repository-created webhook: a missed webhook
+# leaves a repository ungoverned forever and nothing notices. A missed reconcile run is
+# corrected by the next one. New repositories are picked up automatically once added to
+# repositories.json.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Report changes without applying them'
+        type: boolean
+        default: true
+      remove-legacy-rulesets:
+        description: 'Delete rulesets not named "governance: *"'
+        type: boolean
+        default: false
+      only:
+        description: 'Reconcile a single repository (blank = all)'
+        type: string
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'governance/**'
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    name: Reconcile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint governance token
+        uses: actions/create-github-app-token@v1
+        id: token
+        with:
+          app-id: ${{ vars.GOVERNANCE_APP_ID }}
+          private-key: ${{ secrets.GOVERNANCE_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Reconcile
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GOVERNANCE_ORG: ${{ github.repository_owner }}
+          GOVERNANCE_OWNER_LOGIN: ${{ vars.GOVERNANCE_OWNER_LOGIN }}
+          AI_REVIEWER_APP_ID: ${{ vars.AI_REVIEWER_APP_ID }}
+        run: |
+          $params = @{}
+          # A push to governance/** applies immediately; manual runs default to dry-run
+          # so a config change can always be previewed first.
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+              if ('${{ inputs.dry-run }}' -eq 'true')               { $params.DryRun = $true }
+              if ('${{ inputs.remove-legacy-rulesets }}' -eq 'true'){ $params.RemoveLegacyRulesets = $true }
+              if ('${{ inputs.only }}')                             { $params.Only = '${{ inputs.only }}' }
+          }
+          ./governance/Invoke-Reconcile.ps1 @params

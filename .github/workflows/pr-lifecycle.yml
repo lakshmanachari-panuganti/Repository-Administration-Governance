@@ -1,0 +1,487 @@
+name: PR Lifecycle
+
+# Centralised PR lifecycle for every repository in the organisation.
+#
+# The merge gate is a single check run named "ai-review", published by the AI Reviewer
+# App and pinned in each ruleset to that App's integration_id. Nothing else can publish
+# it — verified: the Developer App posting a check of the same name leaves the PR blocked.
+#
+# The verdict job runs with if: always() on purpose. A repository whose ruleset requires
+# "ai-review" deadlocks permanently if the check is never published, so every path
+# through this workflow must end in a published verdict, success or failure.
+#
+# Never switch to pull_request_target. It would expose these secrets to fork PRs.
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'node | powershell | none — selects setup and default test command'
+        type: string
+        default: none
+      test-command:
+        description: 'Overrides the language default. Empty string skips tests.'
+        type: string
+        default: ''
+      enable-agents:
+        description: 'Run the AI reviewer and developer. Flow, guard and tests run either way.'
+        type: boolean
+        default: false
+      ai-branch:
+        type: string
+        default: ai-driven1
+      max-changed-files:
+        type: number
+        default: 20
+      max-changed-lines:
+        type: number
+        default: 400
+      max-rounds:
+        description: 'Reviewer rounds before handing over to a human.'
+        type: number
+        default: 5
+
+concurrency:
+  group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ADMIN_REPO: lakshmanachari-panuganti/Repository-Administration-Governance
+
+jobs:
+  # ------------------------------------------------------------------------- flow
+  # Enforces the promotion path:
+  #
+  #     feature ──> ai-driven1 ──> develop ──> main
+  #
+  # main only accepts develop. Nothing else reaches production without passing through
+  # develop first. A ruleset cannot express "which branch may open this PR", so it is
+  # enforced here and surfaced through the ai-review gate.
+  flow:
+    name: Branch Flow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate promotion path
+        shell: pwsh
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          AI_BRANCH: ${{ inputs.ai-branch }}
+        run: |
+          $base = $env:BASE
+          $head = $env:HEAD
+          $ai   = $env:AI_BRANCH
+          Write-Host "$head -> $base"
+
+          $violation = switch ($base) {
+              'main' {
+                  if ($head -ne 'develop') {
+                      "main only accepts pull requests from develop. This one is from '$head'. Every change must pass through develop before reaching production."
+                  }
+              }
+              'develop' {
+                  if ($head -eq 'main') { "develop cannot take a pull request from main." }
+              }
+              default {
+                  if ($head -in @('main', 'develop')) {
+                      "'$head' cannot open a pull request into '$base' — that reverses the promotion path."
+                  }
+              }
+          }
+
+          if ($violation) {
+              Write-Host "::error::$violation"
+              exit 1
+          }
+          Write-Host 'Promotion path is valid.'
+
+  # ------------------------------------------------------------------ eligibility
+  eligibility:
+    name: Eligibility
+    runs-on: ubuntu-latest
+    outputs:
+      agents: ${{ steps.gate.outputs.agents }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Evaluate
+        id: gate
+        shell: pwsh
+        env:
+          ENABLE_AGENTS: ${{ inputs.enable-agents }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          AI_BRANCH: ${{ inputs.ai-branch }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          $blocked = @()
+          if ($env:ENABLE_AGENTS -ne 'true')       { $blocked += 'agents disabled for this repository' }
+          if ($env:IS_FORK -eq 'true')             { $blocked += 'fork pull request' }
+          if ($env:IS_DRAFT -eq 'true')            { $blocked += 'draft' }
+          if ($env:HEAD_REF -ne $env:AI_BRANCH)    { $blocked += "head is $env:HEAD_REF, agents only act on $env:AI_BRANCH" }
+          if ($env:BASE_REF -eq 'main')            { $blocked += 'target is main; production changes are reviewed by a human' }
+          if (($env:LABELS -split ',') -contains 'needs-human') { $blocked += 'needs-human label' }
+
+          if ($blocked.Count -gt 0) {
+              $reason = $blocked -join '; '
+              Write-Host "Agents will not run: $reason"
+              "agents=false"   >> $env:GITHUB_OUTPUT
+              "reason=$reason" >> $env:GITHUB_OUTPUT
+          }
+          else {
+              "agents=true" >> $env:GITHUB_OUTPUT
+              "reason="     >> $env:GITHUB_OUTPUT
+          }
+
+  # ------------------------------------------------------------------------ guard
+  # Invariants the agents are only *instructed* to follow. A prompt-injected or
+  # misbehaving agent cannot talk its way past these — they are measured, not asked.
+  guard:
+    name: Guard
+    needs: flow
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check invariants
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MAX_FILES: ${{ inputs.max-changed-files }}
+          MAX_LINES: ${{ inputs.max-changed-lines }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = @()
+
+          $files = @(git diff --name-only "$env:BASE_SHA...$env:HEAD_SHA")
+          Write-Host "Changed files: $($files.Count)"
+
+          # develop -> main is a promotion of already-reviewed work; size limits there
+          # would block a legitimate release.
+          if ($env:BASE_REF -ne 'main') {
+              if ($files.Count -gt [int]$env:MAX_FILES) {
+                  $failed += "$($files.Count) files changed, limit is $env:MAX_FILES"
+              }
+
+              $stat = git diff --shortstat "$env:BASE_SHA...$env:HEAD_SHA"
+              $ins = if ($stat -match '(\d+) insertion') { [int]$Matches[1] } else { 0 }
+              $del = if ($stat -match '(\d+) deletion')  { [int]$Matches[1] } else { 0 }
+              Write-Host "Changed lines: $($ins + $del)"
+              if (($ins + $del) -gt [int]$env:MAX_LINES) {
+                  $failed += "$($ins + $del) lines changed, limit is $env:MAX_LINES"
+              }
+
+              # The agents must not rewrite the CI that constrains them.
+              $ci = $files | Where-Object { $_ -like '.github/workflows/*' }
+              if ($ci) { $failed += "workflow files modified: $($ci -join ', ')" }
+          }
+          else {
+              Write-Host 'Promotion to main: size and workflow limits do not apply.'
+          }
+
+          if ($failed.Count -gt 0) {
+              Write-Host "::error::Guard failed. $($failed -join ' | ')"
+              exit 1
+          }
+          Write-Host 'Guard passed.'
+
+      - name: Set up Node
+        if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run tests
+        shell: pwsh
+        env:
+          LANGUAGE: ${{ inputs.language }}
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          $cmd = $env:TEST_COMMAND
+          if ([string]::IsNullOrWhiteSpace($cmd)) {
+              switch ($env:LANGUAGE) {
+                  'node'       { $cmd = 'npm ci && npm test' }
+                  'powershell' { $cmd = 'Invoke-Pester -CI' }
+                  default      { Write-Host 'No test command configured. Skipping.'; return }
+              }
+          }
+          Write-Host "Running: $cmd"
+          Invoke-Expression $cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # ----------------------------------------------------------------------- review
+  review:
+    name: Reviewer Agent
+    needs: [eligibility, flow, guard]
+    if: needs.eligibility.outputs.agents == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: reviewer-token
+        with:
+          app-id: ${{ vars.AI_REVIEWER_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEWER_APP_KEY }}
+
+      - name: Check round budget
+        id: rounds
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MAX_ROUNDS: ${{ inputs.max-rounds }}
+        run: |
+          $reviews = gh api "/repos/$env:REPO/pulls/$env:PR_NUMBER/reviews" --paginate | ConvertFrom-Json
+          $mine = @($reviews | Where-Object { $_.user.type -eq 'Bot' -and $_.state -ne 'COMMENTED' })
+          Write-Host "Reviewer rounds so far: $($mine.Count) of $env:MAX_ROUNDS"
+          if ($mine.Count -ge [int]$env:MAX_ROUNDS) {
+              "exhausted=true" >> $env:GITHUB_OUTPUT
+          } else {
+              "exhausted=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Hand over to a human
+        if: steps.rounds.outputs.exhausted == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api -X POST "/repos/$env:REPO/issues/$env:PR_NUMBER/labels" -f 'labels[]=needs-human'
+          gh api -X POST "/repos/$env:REPO/issues/$env:PR_NUMBER/comments" `
+                 -f body='Review round budget exhausted. Labelled `needs-human`; the agents will stand down on this pull request.'
+          Write-Host '::error::Round budget exhausted.'
+          exit 1
+
+      - uses: actions/checkout@v4
+        if: steps.rounds.outputs.exhausted == 'false'
+        with:
+          fetch-depth: 0
+
+      # Agent definitions live in the administration repository so every participating
+      # repository reviews to the same standard. Without this the --agents flag resolves
+      # to nothing and the review silently degrades to a generic prompt.
+      - name: Fetch shared agent definitions
+        if: steps.rounds.outputs.exhausted == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ADMIN_REPO }}
+          path: .governance
+          sparse-checkout: agents
+          sparse-checkout-cone-mode: false
+
+      - name: Install agent definitions
+        if: steps.rounds.outputs.exhausted == 'false'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .claude/agents | Out-Null
+          Copy-Item .governance/agents/*.md .claude/agents/ -Force
+          Get-ChildItem .claude/agents | ForEach-Object { Write-Host "agent: $($_.Name)" }
+
+      - name: Install Claude Code
+        if: steps.rounds.outputs.exhausted == 'false'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Review
+        if: steps.rounds.outputs.exhausted == 'false'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL || 'opus' }}
+        run: |
+          claude --model "$REVIEWER_MODEL" \
+                 --agents pr-reviewer \
+                 --output-format json \
+                 -p "Review pull request #${PR_NUMBER} using the pr-reviewer subagent. On rounds after the first, review both the updated code and the developer's replies to your earlier comments. Approve by submitting an APPROVE review, or request changes with specific, actionable comments." \
+                 | tee review-result.json
+
+      - name: Fail closed on refusal or empty output
+        if: steps.rounds.outputs.exhausted == 'false'
+        shell: pwsh
+        run: |
+          $output = Get-Content ./review-result.json -Raw -ErrorAction SilentlyContinue
+          if ([string]::IsNullOrWhiteSpace($output)) {
+              Write-Host '::error::Reviewer produced no output. That is not the same as "no findings".'
+              exit 1
+          }
+
+      - name: Did the reviewer approve?
+        if: steps.rounds.outputs.exhausted == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $reviews = gh api "/repos/$env:REPO/pulls/$env:PR_NUMBER/reviews" --paginate | ConvertFrom-Json
+          $latest = @($reviews | Where-Object {
+              $_.user.type -eq 'Bot' -and $_.commit_id -eq $env:HEAD_SHA -and $_.state -ne 'COMMENTED'
+          }) | Select-Object -Last 1
+
+          if (-not $latest) {
+              Write-Host '::error::Reviewer left no verdict on the current head commit.'
+              exit 1
+          }
+          Write-Host "Reviewer verdict: $($latest.state)"
+          if ($latest.state -ne 'APPROVED') { exit 1 }
+
+  # ---------------------------------------------------------------------- respond
+  respond:
+    name: Developer Agent
+    needs: eligibility
+    if: >-
+      needs.eligibility.outputs.agents == 'true' &&
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'changes_requested'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: developer-token
+        with:
+          app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
+          private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ steps.developer-token.outputs.token }}
+
+      - name: Fetch shared agent definitions
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ADMIN_REPO }}
+          path: .governance
+          sparse-checkout: agents
+          sparse-checkout-cone-mode: false
+
+      - name: Install agent definitions
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .claude/agents | Out-Null
+          Copy-Item .governance/agents/*.md .claude/agents/ -Force
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Fix or rebut
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ steps.developer-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.developer-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEVELOPER_MODEL: ${{ vars.DEVELOPER_MODEL || 'sonnet' }}
+        run: |
+          claude --model "$DEVELOPER_MODEL" \
+                 --agents pr-developer \
+                 --output-format json \
+                 -p "Address the open review comments on pull request #${PR_NUMBER} using the pr-developer subagent. Fix what is valid; rebut false positives with technical evidence. Do not modify anything under .github/workflows — the guard rejects it." \
+                 | tee respond-result.json
+
+      - name: Clean up borrowed files
+        if: always()
+        run: rm -rf .governance .claude/agents
+
+  # ---------------------------------------------------------------------- verdict
+  # Always runs. This is the only job that publishes the merge gate, so every path must
+  # reach it — flow violation, guard failure, agent failure, and agents-disabled alike.
+  verdict:
+    name: Publish ai-review
+    needs: [eligibility, flow, guard, review]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: reviewer-token
+        with:
+          app-id: ${{ vars.AI_REVIEWER_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEWER_APP_KEY }}
+
+      - name: Publish check run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FLOW: ${{ needs.flow.result }}
+          GUARD: ${{ needs.guard.result }}
+          REVIEW: ${{ needs.review.result }}
+          AGENTS: ${{ needs.eligibility.outputs.agents }}
+          SKIP_REASON: ${{ needs.eligibility.outputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:FLOW -ne 'success') {
+              $conclusion = 'failure'
+              $title      = 'Invalid promotion path'
+              $summary    = "This pull request does not follow feature -> ai-driven1 -> develop -> main.`n`n[Run log]($env:RUN_URL)"
+          }
+          elseif ($env:GUARD -ne 'success') {
+              $conclusion = 'failure'
+              $title      = 'Guard failed'
+              $summary    = "Invariant checks or tests did not pass. Nothing was reviewed.`n`n[Run log]($env:RUN_URL)"
+          }
+          elseif ($env:AGENTS -ne 'true') {
+              $conclusion = 'success'
+              $title      = 'Guard passed (agents not run)'
+              $summary    = "Promotion path, invariant checks and tests passed. AI review skipped: $env:SKIP_REASON`n`n[Run log]($env:RUN_URL)"
+          }
+          elseif ($env:REVIEW -ne 'success') {
+              $conclusion = 'failure'
+              $title      = 'Changes requested'
+              $summary    = "The reviewer did not approve the current head commit. See the review comments on this pull request.`n`n[Run log]($env:RUN_URL)"
+          }
+          else {
+              $conclusion = 'success'
+              $title      = 'Approved'
+              $summary    = "Promotion path, guard, tests and AI review all passed.`n`n[Run log]($env:RUN_URL)"
+          }
+
+          Write-Host "ai-review -> $conclusion ($title)"
+          gh api -X POST "/repos/$env:REPO/check-runs" `
+                 -f name='ai-review' `
+                 -f head_sha="$env:HEAD_SHA" `
+                 -f status='completed' `
+                 -f conclusion="$conclusion" `
+                 -f "output[title]=$title" `
+                 -f "output[summary]=$summary" `
+                 --jq '"published check " + (.id|tostring) + " by app " + (.app.id|tostring)'
+
+  # ------------------------------------------------------------------ auto-merge
+  # develop only. Pull requests into main are merged by hand by the organisation owner.
+  auto-merge:
+    name: Arm auto-merge
+    needs: verdict
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'develop' &&
+      needs.verdict.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: developer-token
+        with:
+          app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
+          private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
+
+      - name: Enable auto-merge
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.developer-token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # Native auto-merge: GitHub merges when every required check passes. It does not
+          # bypass a single rule — if ai-review fails, the pull request simply waits.
+          gh pr merge $env:PR_URL --squash --auto

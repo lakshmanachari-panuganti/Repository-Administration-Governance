@@ -1,0 +1,49 @@
+{
+  "$comment": [
+    "Desired state for every repository in the organisation.",
+    "The reconcile workflow reads this file and makes reality match it.",
+    "Adding a repository here is the only step needed to onboard it."
+  ],
+
+  "defaults": {
+    "branches": ["ai-driven1", "develop", "main"],
+    "lifecycle": true,
+    "enableAgents": false,
+    "language": "none",
+    "testCommand": "",
+    "maxChangedFiles": 20,
+    "maxChangedLines": 400,
+    "extraRequiredChecks": { "main": [], "develop": [] }
+  },
+
+  "repositories": {
+    "Test-Repo": {
+      "enableAgents": true
+    },
+    "PowerShell": {
+      "language": "powershell"
+    },
+    "UserStory-Implementation": {},
+    "PhotoSheet-Maker": {},
+    "navya-cloud-kitchen": {},
+    "OMG.PSUtilities": {
+      "language": "powershell",
+      "enableAgents": true,
+      "extraRequiredChecks": {
+        "main": ["Validate, Test, and Build"],
+        "develop": ["Validate, Test, and Build"]
+      }
+    },
+    "www.srilatha.art": {
+      "language": "node",
+      "enableAgents": true,
+      "extraRequiredChecks": {
+        "main": [],
+        "develop": ["ci/agent-guard"]
+      }
+    },
+    "Repository-Administration-Governance": {
+      "branches": ["ai-driven1", "develop", "main"]
+    }
+  }
+}
