@@ -37,7 +37,26 @@ jobs:
     name: Reconcile
     runs-on: ubuntu-latest
     steps:
+      # This job holds administration:write over every repository in the organisation, and
+      # governance/repositories.json is its instruction set. workflow_dispatch can be run
+      # from ANY ref, so without this the desired state could be read from a branch that
+      # an agent can push to — turning one unreviewed commit into org-wide policy.
+      # main is protected and requires code-owner approval; nothing else is trusted here.
+      - name: Refuse to run from anything but main
+        shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if ($env:REF -ne 'refs/heads/main') {
+              Write-Host "::error::Reconcile may only run from refs/heads/main. This run is on $env:REF."
+              exit 1
+          }
+          Write-Host 'Running from main.'
+
       - uses: actions/checkout@v4
+        with:
+          # Explicit: never resolve desired state from the dispatching ref.
+          ref: main
 
       - name: Mint governance token
         uses: actions/create-github-app-token@v1
