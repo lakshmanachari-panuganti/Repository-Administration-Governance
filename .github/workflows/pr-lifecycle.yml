@@ -261,13 +261,45 @@ jobs:
           TEST_COMMAND: ${{ inputs.test-command }}
         run: |
           $cmd = $env:TEST_COMMAND
+
           if ([string]::IsNullOrWhiteSpace($cmd)) {
+              # A repository with no tests must not fail the guard. Both default commands
+              # treat "nothing to run" as an error — Invoke-Pester exits non-zero with
+              # "No test files were found", and npm test fails when no test script is
+              # defined. That turns a coverage gap into a blocked pull request.
+              #
+              # Missing tests are reported loudly instead, so the gap stays visible.
               switch ($env:LANGUAGE) {
-                  'node'       { $cmd = 'npm ci && npm test' }
-                  'powershell' { $cmd = 'Invoke-Pester -CI' }
-                  default      { Write-Host 'No test command configured. Skipping.'; return }
+                  'node' {
+                      if (-not (Test-Path package.json)) {
+                          Write-Host '::warning::language is node but there is no package.json. No tests run.'
+                          return
+                      }
+                      $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+                      $hasTest = $pkg.PSObject.Properties.Name -contains 'scripts' -and
+                                 $pkg.scripts.PSObject.Properties.Name -contains 'test'
+                      if (-not $hasTest) {
+                          Write-Host '::warning::package.json defines no test script. No tests run.'
+                          return
+                      }
+                      $cmd = 'npm ci && npm test'
+                  }
+                  'powershell' {
+                      $testFiles = @(Get-ChildItem -Recurse -Filter '*.Tests.ps1' -ErrorAction SilentlyContinue)
+                      if ($testFiles.Count -eq 0) {
+                          Write-Host '::warning::No *.Tests.ps1 files found. No tests run.'
+                          return
+                      }
+                      Write-Host "Found $($testFiles.Count) Pester test file(s)."
+                      $cmd = 'Invoke-Pester -CI'
+                  }
+                  default {
+                      Write-Host 'No test command configured. Skipping.'
+                      return
+                  }
               }
           }
+
           Write-Host "Running: $cmd"
           Invoke-Expression $cmd
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
