@@ -66,6 +66,10 @@ jobs:
   # enforced here and surfaced through the ai-review gate.
   flow:
     name: Branch Flow
+    # pull_request only. On a pull_request_review event there is nothing new to validate,
+    # and running anyway leaves a red check and a failed run on a pull request that is
+    # merely being approved.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Validate promotion path
@@ -191,6 +195,8 @@ jobs:
   guard:
     name: Guard
     needs: flow
+    # Same reason as flow: the diff has not changed when someone submits a review.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
