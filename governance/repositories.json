@@ -5,7 +5,21 @@
     "Adding a repository here is the only step needed to onboard it."
   ],
 
+  "$ownerBypassOnDevelop": [
+    "TEMPORARY - granted 2026-08-04, REMOVE ON OR BEFORE 2026-08-06.",
+    "GitHub has no setting that lets anyone approve their own pull request, and this",
+    "organisation has one human, so the sole maintainer could not merge their own work.",
+    "This grants the organisation owner a bypass on develop in pull_request mode: a pull",
+    "request is still required and direct pushes are still refused, only the approval",
+    "requirement is waived.",
+    "NEVER set this for main. A bypass skips every rule in the ruleset, which on main",
+    "would discard the code-owner gate that keeps bots out of production.",
+    "The Developer App is deliberately NOT a bypass actor, so it still cannot self-merge.",
+    "Rulesets have no expiry. Set this back to false; see TODO.txt."
+  ],
+
   "defaults": {
+    "ownerBypassOnDevelop": true,
     "branches": ["ai-driven1", "develop", "main"],
     "lifecycle": true,
     "enableAgents": false,
