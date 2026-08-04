@@ -45,6 +45,10 @@ concurrency:
   group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
+# Left at contents: read. The organisation's default workflow permission is "read", and a
+# reusable workflow cannot request more than its caller holds — adding pull-requests: read
+# here failed every run with startup_failure before any job began. Anything needing more
+# than contents uses an App token.
 permissions:
   contents: read
 
@@ -65,6 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate promotion path
+        id: validate
         shell: pwsh
         env:
           BASE: ${{ github.event.pull_request.base.ref }}
@@ -94,9 +99,52 @@ jobs:
 
           if ($violation) {
               Write-Host "::error::$violation"
+              "violation=$violation" >> $env:GITHUB_OUTPUT
               exit 1
           }
+          "violation=" >> $env:GITHUB_OUTPUT
           Write-Host 'Promotion path is valid.'
+
+      # A failing check is not enough on its own. Check runs are keyed by commit, not by
+      # pull request, so one commit that is the head of two pull requests has ONE
+      # ai-review check between them. Opening ai-driven1 -> develop and ai-driven1 -> main
+      # from the same commit lets the main-targeted pull request inherit the green verdict
+      # published for the develop-targeted one — verified, the illegal pull request showed
+      # ai-review: success.
+      #
+      # Closing the pull request removes it rather than relying on a check that a sibling
+      # can overwrite.
+      - name: Close a pull request that breaks the promotion path
+        if: failure()
+        uses: actions/create-github-app-token@v1
+        id: reviewer-token
+        with:
+          app-id: ${{ vars.AI_REVIEWER_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEWER_APP_KEY }}
+
+      - name: Close it
+        if: failure() && steps.reviewer-token.outputs.token != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VIOLATION: ${{ steps.validate.outputs.violation }}
+        run: |
+          $body = @(
+              'This pull request does not follow the promotion path and has been closed automatically.'
+              ''
+              "> $env:VIOLATION"
+              ''
+              '```'
+              'feature ──> ai-driven1 ──> develop ──> main'
+              '```'
+              ''
+              'Open it against the correct base branch instead.'
+          ) -join "`n"
+
+          gh api -X POST "/repos/$env:REPO/issues/$env:PR_NUMBER/comments" -f "body=$body" | Out-Null
+          gh api -X PATCH "/repos/$env:REPO/pulls/$env:PR_NUMBER" -f state='closed' --jq '.state'
 
   # ------------------------------------------------------------------ eligibility
   eligibility:
@@ -157,6 +205,8 @@ jobs:
           MAX_FILES: ${{ inputs.max-changed-files }}
           MAX_LINES: ${{ inputs.max-changed-lines }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          AI_BRANCH: ${{ inputs.ai-branch }}
         run: |
           $ErrorActionPreference = 'Stop'
           $failed = @()
@@ -179,9 +229,14 @@ jobs:
                   $failed += "$($ins + $del) lines changed, limit is $env:MAX_LINES"
               }
 
-              # The agents must not rewrite the CI that constrains them.
-              $ci = $files | Where-Object { $_ -like '.github/workflows/*' }
-              if ($ci) { $failed += "workflow files modified: $($ci -join ', ')" }
+              # The agents must not rewrite the CI that constrains them. Scoped to the AI
+              # branch on purpose: a human changing CI is ordinary work that goes through
+              # review, and forbidding it outright blocks the very pull request that
+              # onboards a repository onto this workflow.
+              if ($env:HEAD_REF -eq $env:AI_BRANCH) {
+                  $ci = $files | Where-Object { $_ -like '.github/workflows/*' }
+                  if ($ci) { $failed += "agent branch modified workflow files: $($ci -join ', ')" }
+              }
           }
           else {
               Write-Host 'Promotion to main: size and workflow limits do not apply.'
@@ -401,6 +456,8 @@ jobs:
     needs: [eligibility, flow, guard, review]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    outputs:
+      conclusion: ${{ steps.publish.outputs.conclusion }}
     steps:
       - uses: actions/create-github-app-token@v1
         id: reviewer-token
@@ -409,6 +466,7 @@ jobs:
           private-key: ${{ secrets.AI_REVIEWER_APP_KEY }}
 
       - name: Publish check run
+        id: publish
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
@@ -450,6 +508,7 @@ jobs:
           }
 
           Write-Host "ai-review -> $conclusion ($title)"
+          "conclusion=$conclusion" >> $env:GITHUB_OUTPUT
           gh api -X POST "/repos/$env:REPO/check-runs" `
                  -f name='ai-review' `
                  -f head_sha="$env:HEAD_SHA" `
@@ -464,10 +523,20 @@ jobs:
   auto-merge:
     name: Arm auto-merge
     needs: verdict
+    # The job runs on every pull request into develop and decides inside itself.
+    #
+    # The gate is needs.verdict.outputs.conclusion, NOT needs.verdict.result: the verdict
+    # job succeeds whenever it manages to publish a check, including when the check it
+    # publishes is a failure. Testing the job result armed auto-merge on guard failures,
+    # which merges them outright in any repository where ai-review is not yet required.
+    #
+    # That gate is evaluated in a step rather than in this job-level `if` because a job
+    # `if` referencing needs.<job>.outputs silently evaluated false and skipped the job
+    # even when the verdict was success. Deciding in a step makes the value observable
+    # in the log instead of failing invisibly.
     if: >-
       always() && github.event_name == 'pull_request' &&
-      github.event.pull_request.base.ref == 'develop' &&
-      needs.verdict.result == 'success'
+      github.event.pull_request.base.ref == 'develop'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v1
@@ -476,7 +545,64 @@ jobs:
           app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
           private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
 
+      - name: Should auto-merge be armed?
+        id: gate
+        shell: pwsh
+        env:
+          VERDICT_RESULT: ${{ needs.verdict.result }}
+          VERDICT_CONCLUSION: ${{ needs.verdict.outputs.conclusion }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ steps.developer-token.outputs.token }}
+        run: |
+          Write-Host "verdict job result : '$env:VERDICT_RESULT'"
+          Write-Host "verdict conclusion : '$env:VERDICT_CONCLUSION'"
+
+          # Read labels live, NOT from github.event.pull_request.labels. The payload is
+          # frozen at the moment the event fired, so a needs-human label added seconds
+          # after `opened` is invisible to this run — verified: a labelled pull request
+          # merged itself 52 seconds after being labelled.
+          $labels = @(gh api "/repos/$env:REPO/issues/$env:PR_NUMBER/labels" --jq '.[].name')
+          Write-Host "labels (live)      : $($labels -join ', ')"
+
+          $reasons = @()
+          # Fail closed: anything other than an explicit success leaves auto-merge off.
+          if ($env:VERDICT_CONCLUSION -ne 'success') { $reasons += "verdict is '$env:VERDICT_CONCLUSION'" }
+
+          # gh pr merge --auto errors outright on a draft, failing the run for no reason.
+          if ($env:IS_DRAFT -eq 'true') { $reasons += 'pull request is a draft' }
+
+          # needs-human means a person should look at this. Stopping the agents but still
+          # merging it automatically defeats the entire point of the label.
+          if ($labels -contains 'needs-human') { $reasons += 'needs-human label' }
+
+          if ($reasons.Count -gt 0) {
+              'go=false' >> $env:GITHUB_OUTPUT
+              Write-Host "Not arming auto-merge: $($reasons -join '; ')"
+          }
+          else {
+              'go=true' >> $env:GITHUB_OUTPUT
+              Write-Host 'Arming auto-merge.'
+          }
+
+      # Arming is not the only state that matters. If auto-merge was armed by an earlier
+      # run and the pull request has since been labelled needs-human or turned back into
+      # a draft, leaving it armed means it still merges itself. Disarm explicitly.
+      - name: Disarm auto-merge
+        if: steps.gate.outputs.go != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.developer-token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          ALREADY_ARMED: ${{ github.event.pull_request.auto_merge != null }}
+        run: |
+          if ($env:ALREADY_ARMED -ne 'true') { Write-Host 'Auto-merge was not armed.'; exit 0 }
+          Write-Host 'Auto-merge is armed but should not be. Disabling.'
+          gh pr merge $env:PR_URL --disable-auto
+
       - name: Enable auto-merge
+        if: steps.gate.outputs.go == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.developer-token.outputs.token }}
@@ -487,6 +613,7 @@ jobs:
           gh pr merge $env:PR_URL --squash --auto
 
       - name: Update branch if behind
+        if: steps.gate.outputs.go == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.developer-token.outputs.token }}
