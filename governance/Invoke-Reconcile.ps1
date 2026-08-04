@@ -179,6 +179,36 @@ function New-RulesetBody {
 
 # ------------------------------------------------------------------- reconcilers
 
+function Test-LifecycleAdopted {
+    param([string]$Repo, [string]$DefaultBranch)
+
+    # A repository has adopted the lifecycle only if one of its workflows *calls* the
+    # reusable one. Testing for a file named pr-lifecycle.yml is not the same thing:
+    # this administration repository contains that file as the reusable workflow itself
+    # (on: workflow_call), which never runs on a pull request. Treating it as adopted
+    # required ai-review on a branch where nothing could ever publish it, and deadlocked
+    # main here until the check was removed.
+    $listing = Invoke-GH -AllowFailure -Arguments @(
+        'api', "/repos/$Org/$Repo/contents/.github/workflows?ref=$DefaultBranch", '--jq', '.[].name')
+    if (-not $listing) { return $false }
+
+    foreach ($file in @($listing)) {
+        $file = "$file".Trim()
+        if ($file -notmatch '\.ya?ml$') { continue }
+
+        $encoded = Invoke-GH -AllowFailure -Arguments @(
+            'api', "/repos/$Org/$Repo/contents/.github/workflows/$file`?ref=$DefaultBranch", '--jq', '.content')
+        if (-not $encoded) { continue }
+
+        $text = [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String((($encoded -join '') -replace '\s', '')))
+
+        # `uses: .../pr-lifecycle.yml@ref` — the caller reference.
+        if ($text -match 'pr-lifecycle\.ya?ml@') { return $true }
+    }
+    return $false
+}
+
 function Sync-Branch {
     param([string]$Repo, [string]$Branch, [string]$BaseSha)
 
@@ -379,8 +409,7 @@ foreach ($name in $repoNames) {
         Sync-SecuritySettings   -Repo $name
         $hasCodeowners = Sync-Codeowners -Repo $name -DefaultBranch $defaultBranch
 
-        $hasLifecycle = [bool](Invoke-GH -AllowFailure -Arguments @(
-            'api', "/repos/$Org/$name/contents/.github/workflows/pr-lifecycle.yml?ref=$defaultBranch", '--jq', '.sha'))
+        $hasLifecycle = Test-LifecycleAdopted -Repo $name -DefaultBranch $defaultBranch
         if (-not $hasLifecycle) {
             Write-Warn "$name has not adopted .github/workflows/pr-lifecycle.yml. The ai-review gate is left off until it does — requiring a check nothing can publish would block the branch permanently."
         }
