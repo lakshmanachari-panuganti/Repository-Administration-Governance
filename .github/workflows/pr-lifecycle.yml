@@ -434,10 +434,15 @@ jobs:
   respond:
     name: Developer Agent
     needs: eligibility
+    # The review author is checked, not just the review state. Any identity holding
+    # pull_requests:write can submit changes_requested, and this job hands that review
+    # body to an agent with contents:write — including the Developer App itself, which
+    # would be a self-triggering loop. Only the Reviewer App can drive the developer.
     if: >-
       needs.eligibility.outputs.agents == 'true' &&
       github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'changes_requested'
+      github.event.review.state == 'changes_requested' &&
+      github.event.review.user.login == 'devils-advocate-review[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v1
