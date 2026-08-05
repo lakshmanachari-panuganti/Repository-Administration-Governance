@@ -506,6 +506,12 @@ jobs:
           GITHUB_TOKEN: ${{ steps.reviewer-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL || 'opus' }}
+          # Without this the reviewer cannot tell an executed test suite from an
+          # unexecuted one and reports every new test file as dead code. It has no
+          # runtime of its own by design, so the guard's result is its only evidence.
+          TEST_EVIDENCE: >-
+            ${{ inputs.test-command == '' && 'No test command is configured for this repository, so no suite ran.'
+            || format('The Guard job ran `{0}` on this head commit and the job result was {1}. Treat that as authoritative: do not report new tests as unexecuted.', inputs.test-command, needs.guard.result) }}
         run: |
           # --allowedTools is required. Without it every gh call is refused by the CLI's
           # permission prompt in a non-interactive runner, and the agent completes having
@@ -519,7 +525,7 @@ jobs:
                  --agents pr-reviewer \
                  --allowedTools "Bash(gh:*),Read,Grep,Glob" \
                  --output-format json \
-                 -p "Review pull request #${PR_NUMBER} using the pr-reviewer subagent. On rounds after the first, review both the updated code and the developer's replies to your earlier comments. Approve by submitting an APPROVE review, or request changes with specific, actionable comments." \
+                 -p "Review pull request #${PR_NUMBER} using the pr-reviewer subagent. On rounds after the first, review both the updated code and the developer's replies to your earlier comments. ${TEST_EVIDENCE} Approve by submitting an APPROVE review, or request changes with specific, actionable comments." \
                  | tee review-result.json
 
       - name: Fail closed on refusal or empty output
