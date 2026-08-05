@@ -645,6 +645,48 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
+          # Consider the repository's OWN checks, without requiring them.
+          #
+          # Deploy and audit workflows are path-filtered, so making them required status
+          # checks would block every pull request that does not touch those paths - a
+          # required check that never runs is a permanent deadlock. But leaving them
+          # entirely unconsidered means auto-merge does not wait for the build, and a
+          # pull request can merge while its build is still running or already failing.
+          #
+          # So: wait for whatever actually started, and fail the verdict if any of it
+          # failed. A check that never runs is simply absent and blocks nothing.
+          $ignore = @('ai-review')
+          $deadline = (Get-Date).AddMinutes(12)
+          $failedChecks = @()
+
+          while ($true) {
+              $runs = gh api "/repos/$env:REPO/commits/$env:HEAD_SHA/check-runs?per_page=100" --paginate |
+                      ConvertFrom-Json |
+                      ForEach-Object { $_.check_runs } |
+                      Where-Object { $_.name -notin $ignore -and $_.name -notlike 'lifecycle /*' }
+
+              $pending = @($runs | Where-Object { $_.status -ne 'completed' })
+              $failedChecks = @($runs | Where-Object {
+                  $_.status -eq 'completed' -and $_.conclusion -in @('failure', 'timed_out', 'startup_failure')
+              })
+
+              # Stop early on failure - waiting for the rest changes nothing.
+              if ($failedChecks.Count -gt 0) { break }
+              if ($pending.Count -eq 0) { break }
+              if ((Get-Date) -gt $deadline) {
+                  Write-Host "::warning::Still waiting on $($pending.Count) check(s) after 12 minutes: $(($pending.name) -join ', '). Proceeding without them."
+                  break
+              }
+
+              Write-Host "Waiting on $($pending.Count) check(s): $(($pending.name) -join ', ')"
+              Start-Sleep -Seconds 20
+          }
+
+          $otherChecksFailed = $failedChecks.Count -gt 0
+          if ($otherChecksFailed) {
+              Write-Host "Repository checks failed: $(($failedChecks.name) -join ', ')"
+          }
+
           if ($env:FLOW -ne 'success') {
               $conclusion = 'failure'
               $title      = 'Invalid promotion path'
@@ -654,6 +696,11 @@ jobs:
               $conclusion = 'failure'
               $title      = 'Guard failed'
               $summary    = "Invariant checks or tests did not pass. Nothing was reviewed.`n`n[Run log]($env:RUN_URL)"
+          }
+          elseif ($otherChecksFailed) {
+              $conclusion = 'failure'
+              $title      = 'Repository checks failed'
+              $summary    = "The lifecycle passed, but this repository's own checks did not: $(($failedChecks.name) -join ', ').`n`n[Run log]($env:RUN_URL)"
           }
           elseif ($env:AGENTS -ne 'true') {
               $conclusion = 'success'
