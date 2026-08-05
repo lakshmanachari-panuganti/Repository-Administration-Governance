@@ -6,7 +6,10 @@
   ],
 
   "$ownerBypassOnDevelop": [
-    "TEMPORARY - granted 2026-08-04, REMOVE ON OR BEFORE 2026-08-06.",
+    "REVOKED 2026-08-06. Granted 2026-08-04 for two days; the term has expired and the",
+    "flag is now false, so reconcile clears the bypass actors from the develop ruleset.",
+    "Kept documented rather than deleted because the underlying constraint has not gone",
+    "away and someone will need this reasoning before granting it again.",
     "GitHub has no setting that lets anyone approve their own pull request, and this",
     "organisation has one human, so the sole maintainer could not merge their own work.",
     "This grants the organisation owner a bypass on develop in pull_request mode: a pull",
@@ -19,7 +22,7 @@
   ],
 
   "defaults": {
-    "ownerBypassOnDevelop": true,
+    "ownerBypassOnDevelop": false,
     "branches": ["ai-driven1", "develop", "main"],
     "lifecycle": true,
     "enableAgents": false,
