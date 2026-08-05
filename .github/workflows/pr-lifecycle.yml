@@ -297,16 +297,27 @@ jobs:
           # develop -> main is a promotion of already-reviewed work; size limits there
           # would block a legitimate release.
           if ($env:BASE_REF -ne 'main') {
-              if ($files.Count -gt [int]$env:MAX_FILES) {
-                  $failed += "$($files.Count) files changed, limit is $env:MAX_FILES"
-              }
+              # Size limits constrain AGENTS, not everyone. A Dependabot lockfile bump runs
+              # to hundreds of lines as a matter of course - eslint 9 to 10 produced 510 -
+              # and a human refactor legitimately touches many files. Applying the cap
+              # universally blocked routine dependency updates for saying nothing about
+              # risk. The author check is done first because these limits depend on it.
+              $agentLogins = @($env:AGENT_LOGINS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              $isAgentAuthored = [bool](@($agentLogins | Where-Object { $_ -eq $env:PR_AUTHOR }).Count)
+              Write-Host "author: $env:PR_AUTHOR (agent-authored: $isAgentAuthored)"
 
               $stat = git diff --shortstat "$env:BASE_SHA...$env:HEAD_SHA"
               $ins = if ($stat -match '(\d+) insertion') { [int]$Matches[1] } else { 0 }
               $del = if ($stat -match '(\d+) deletion')  { [int]$Matches[1] } else { 0 }
               Write-Host "Changed lines: $($ins + $del)"
-              if (($ins + $del) -gt [int]$env:MAX_LINES) {
-                  $failed += "$($ins + $del) lines changed, limit is $env:MAX_LINES"
+
+              if ($isAgentAuthored) {
+                  if ($files.Count -gt [int]$env:MAX_FILES) {
+                      $failed += "$($files.Count) files changed, limit is $env:MAX_FILES"
+                  }
+                  if (($ins + $del) -gt [int]$env:MAX_LINES) {
+                      $failed += "$($ins + $del) lines changed, limit is $env:MAX_LINES"
+                  }
               }
 
               # The agents must not rewrite the CI that constrains them. Scoped to the AI
@@ -320,11 +331,7 @@ jobs:
               #
               # github.event.pull_request.user.login is the "<slug>[bot]" spelling. Note it
               # differs from `gh pr view --json author`, which returns "app/<slug>" — both
-              # are matched here so the list stays correct wherever it is reused.
-              $agentLogins = @($env:AGENT_LOGINS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-              $isAgentAuthored = [bool](@($agentLogins | Where-Object { $_ -eq $env:PR_AUTHOR }).Count)
-              Write-Host "author: $env:PR_AUTHOR (agent-authored: $isAgentAuthored)"
-
+              # are matched in the default list so it stays correct wherever it is reused.
               if ($isAgentAuthored) {
                   # Withholding workflows:write from the Developer App stops it editing
                   # .github/workflows, but not the other files that CI executes with
