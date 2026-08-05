@@ -142,7 +142,16 @@ function New-RulesetBody {
     # Assigned before the hashtable, not inline. Returning @('squash') from an if
     # expression unwraps the single-element array to a scalar, and the ruleset API
     # rejects a string where it expects a list.
-    $mergeMethods = @('squash')
+    # develop takes squash for feature work (one pull request, one commit) but must also
+    # permit a merge commit. Squashing a branch that merges main into develop flattens the
+    # merge and discards main as a parent, so git keeps seeing the branches as divergent
+    # and the next release pull request cannot be merged at all. Observed twice on
+    # www.srilatha.art: the sync landed, the content was correct, and the release stayed
+    # unmergeable because the ancestry was gone.
+    #
+    # Auto-merge always squashes, which is correct for the feature work it handles. A sync
+    # is merged by hand with a merge commit.
+    $mergeMethods = @('squash', 'merge')
     if ($isMain) { $mergeMethods = @('merge') }
 
     $rules += @{
