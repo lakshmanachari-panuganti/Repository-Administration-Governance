@@ -609,3 +609,11 @@ if ($env:GITHUB_STEP_SUMMARY) {
 }
 
 if ($failed.Count -gt 0) { throw "Reconcile failed for: $($failed -join ', ')" }
+
+# Explicit success. Every probe here runs through Invoke-GH -AllowFailure, which leaves
+# $LASTEXITCODE set when a call legitimately 404s - a repository with no classic branch
+# protection, or an absent CODEOWNERS. Without this the script ends carrying that value
+# and the workflow step inherits it, so the nightly run reported failure every night
+# while reporting "Failed repos: 0" in the same breath. A job that cries wolf nightly is
+# one nobody reads when it finally means it.
+exit 0
