@@ -40,6 +40,13 @@ on:
         description: 'Reviewer rounds before handing over to a human.'
         type: number
         default: 5
+      ignore-checks:
+        description: >-
+          Comma-separated check names the verdict must NOT treat as blocking. For checks
+          that are known-failing for an analysed and accepted reason. Every entry is a
+          deliberate hole: state why, and when it goes away.
+        type: string
+        default: ''
       agent-logins:
         description: >-
           Comma-separated logins treated as agents. Both spellings are included on purpose:
@@ -641,6 +648,7 @@ jobs:
           REVIEW: ${{ needs.review.result }}
           AGENTS: ${{ needs.eligibility.outputs.agents }}
           SKIP_REASON: ${{ needs.eligibility.outputs.reason }}
+          IGNORE_CHECKS: ${{ inputs.ignore-checks }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -655,7 +663,14 @@ jobs:
           #
           # So: wait for whatever actually started, and fail the verdict if any of it
           # failed. A check that never runs is simply absent and blocks nothing.
-          $ignore = @('ai-review')
+          # ai-review is always excluded - it is this job's own output, and considering it
+          # would make the verdict depend on itself. Anything else comes from the caller.
+          $ignore = @('ai-review') + @(
+              $env:IGNORE_CHECKS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          )
+          if ($ignore.Count -gt 1) {
+              Write-Host "Not treating these checks as blocking: $(($ignore | Select-Object -Skip 1) -join ', ')"
+          }
           $deadline = (Get-Date).AddMinutes(12)
           $failedChecks = @()
 
