@@ -104,8 +104,22 @@ function New-RulesetBody {
 
     $rules = @(
         @{ type = 'deletion' }
-        @{ type = 'non_fast_forward' }
     )
+
+    # non_fast_forward everywhere except the AI branch.
+    #
+    # ai-driven1 is squash-merged into develop, which leaves it with no commit in common
+    # with its base. Without force-push it can be neither reset nor deleted, so the
+    # divergence accumulates until every cycle needs a human to resolve conflicts by hand -
+    # seven times in one day, on the branch whose whole purpose is unattended work.
+    #
+    # Nothing is lost by allowing it. Agent commits are attributed to the App, and every
+    # merge into develop is a squash commit carrying the full diff alongside its pull
+    # request. The record lives in develop, not in this branch's reflog. deletion stays
+    # blocked so the branch itself cannot disappear.
+    if ($Branch -ne 'ai-driven1') {
+        $rules += @{ type = 'non_fast_forward' }
+    }
 
     if ($Branch -eq 'ai-driven1') {
         # The AI development branch. The Developer App pushes here directly, so no
@@ -243,12 +257,27 @@ function Sync-Branch {
     if ($exists) { return }
 
     Write-Change "create branch $Branch"
-    if (-not $DryRun) {
-        Invoke-GH -Arguments @(
-            'api', '-X', 'POST', "/repos/$Org/$Repo/git/refs",
-            '-f', "ref=refs/heads/$Branch", '-f', "sha=$BaseSha"
-        ) | Out-Null
+    if ($DryRun) { return }
+
+    # Tolerate "already exists". The check above can come back empty on a transient error,
+    # and treating that as "absent" turned a successful state into a hard failure for the
+    # whole repository. Creating a branch is idempotent in intent, so make it idempotent in
+    # practice rather than trusting a single probe.
+    $result = Invoke-GH -AllowFailure -Arguments @(
+        'api', '-X', 'POST', "/repos/$Org/$Repo/git/refs",
+        '-f', "ref=refs/heads/$Branch", '-f', "sha=$BaseSha"
+    )
+
+    if ($result) { return }
+
+    $recheck = Invoke-GH -AllowFailure -Arguments @(
+        'api', "/repos/$Org/$Repo/git/refs/heads/$Branch", '--jq', '.object.sha')
+    if ($recheck) {
+        Write-Host "         (branch $Branch already existed; the existence probe had failed)"
+        return
     }
+
+    throw "could not create branch $Branch in $Repo"
 }
 
 function Sync-Ruleset {
