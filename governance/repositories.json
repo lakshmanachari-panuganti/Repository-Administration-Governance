@@ -6,20 +6,38 @@
   ],
 
   "$ownerBypassOnDevelop": [
-    "TEMPORARY - granted 2026-08-04, REMOVE ON OR BEFORE 2026-08-06.",
+    "REVOKED 2026-08-06. Granted 2026-08-04 for two days; the term has expired and the",
+    "flag is now false, so reconcile clears the bypass actors from the develop ruleset.",
+    "Kept documented rather than deleted because the underlying constraint has not gone",
+    "away and someone will need this reasoning before granting it again.",
     "GitHub has no setting that lets anyone approve their own pull request, and this",
     "organisation has one human, so the sole maintainer could not merge their own work.",
     "This grants the organisation owner a bypass on develop in pull_request mode: a pull",
     "request is still required and direct pushes are still refused, only the approval",
     "requirement is waived.",
-    "NEVER set this for main. A bypass skips every rule in the ruleset, which on main",
-    "would discard the code-owner gate that keeps bots out of production.",
     "The Developer App is deliberately NOT a bypass actor, so it still cannot self-merge.",
     "Rulesets have no expiry. Set this back to false; see TODO.txt."
   ],
 
+  "$ownerBypassOnMain": [
+    "PERMANENT while this organisation has one human. Remove the day a second human joins",
+    "PR Approvers - two humans can approve each other and neither branch needs a bypass.",
+    "An earlier note here said NEVER bypass main, on the grounds that it would discard the",
+    "code-owner gate that keeps bots out of production. That was wrong about who a bypass",
+    "applies to. A bypass is granted to a named actor, and OrganizationAdmin is a human",
+    "role: the Developer App is not an organisation admin, cannot be a code owner, and is",
+    "not on the list, so its position is unchanged and no bot gains a path to main.",
+    "Without this, every release pull request is unmergeable by anyone. main requires a",
+    "code-owner approval, the sole code owner is the person who opened the release, and",
+    "GitHub does not allow self-approval. Test-Repo #27 hit exactly this and stuck.",
+    "The real cost, which is narrower but not nothing: a bypass waives EVERY rule in the",
+    "ruleset, so using it also waives the required ai-review check. GitHub has no per-rule",
+    "granularity. Read the check status before merging; the button will not refuse for you."
+  ],
+
   "defaults": {
-    "ownerBypassOnDevelop": true,
+    "ownerBypassOnDevelop": false,
+    "ownerBypassOnMain": true,
     "branches": ["ai-driven1", "develop", "main"],
     "lifecycle": true,
     "enableAgents": false,

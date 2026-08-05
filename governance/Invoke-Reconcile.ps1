@@ -99,7 +99,9 @@ function New-RulesetBody {
         # lifecycle workflow means no job can ever publish that check.
         [bool]$HasLifecycle = $false,
         # Temporary. See ownerBypassOnDevelop in repositories.json.
-        [bool]$OwnerBypassOnDevelop = $false
+        [bool]$OwnerBypassOnDevelop = $false,
+        # Permanent while this organisation has one human. See ownerBypassOnMain.
+        [bool]$OwnerBypassOnMain = $false
     )
 
     $rules = @(
@@ -201,19 +203,29 @@ function New-RulesetBody {
         }
     }
 
-    # main keeps an empty bypass list: "enforce repository administrators to follow the
-    # same protection rules". Nothing, including the owner, merges to production without
-    # code-owner approval.
-    #
-    # develop grants the organisation owner a bypass in pull_request mode, because GitHub
-    # has no way to let anyone approve their own pull request and this organisation has one
-    # human. Without it the sole maintainer cannot merge their own work at all.
+    # Both bypasses exist for one reason: GitHub has no way to let anyone approve their own
+    # pull request, and this organisation has one human. Every release to main is opened by
+    # that human and must be approved by a code owner, who is the same person. Without a
+    # bypass the release pull request is unmergeable by anyone, forever - which is what
+    # happened to Test-Repo #27.
     #
     # pull_request mode, not always: a pull request is still required and direct pushes are
-    # still refused. Only the approval requirement is waived, and only for a named human -
-    # the Developer App is deliberately not on this list, so it still cannot self-merge.
+    # still refused.
+    #
+    # This does NOT reopen main to bots, which was the original objection to bypassing it.
+    # A bypass is granted to a named actor, and OrganizationAdmin is a human role: the
+    # Developer App is not an organisation admin, cannot be a code owner, and is not on this
+    # list, so nothing about its position changes. What the bypass does cost is real and
+    # narrower than "the code-owner gate is gone": when the owner uses it, the required
+    # ai-review check is waived along with the approval, because a bypass waives every rule
+    # in the ruleset and GitHub offers no per-rule granularity. The owner must therefore
+    # read the check status before merging rather than trusting the button to refuse.
+    #
+    # Remove this the day a second human joins PR Approvers: two humans can approve each
+    # other and no bypass is needed on either branch.
     $bypass = @()
-    if ($Branch -eq 'develop' -and $OwnerBypassOnDevelop) {
+    if (($Branch -eq 'develop' -and $OwnerBypassOnDevelop) -or
+        ($Branch -eq 'main' -and $OwnerBypassOnMain)) {
         $bypass = @(@{ actor_type = 'OrganizationAdmin'; actor_id = 1; bypass_mode = 'pull_request' })
     }
 
@@ -584,7 +596,8 @@ foreach ($name in $repoNames) {
             $branchHasLifecycle = if ($lifecycleOn.ContainsKey($branch)) { [bool]$lifecycleOn[$branch] } else { $false }
             Sync-Ruleset -Repo $name -Body (New-RulesetBody -Branch $branch -ExtraChecks $checks `
                 -HasCodeowners $hasCodeowners -HasLifecycle $branchHasLifecycle `
-                -OwnerBypassOnDevelop ([bool](Get-RepoSetting $repoConfig 'ownerBypassOnDevelop')))
+                -OwnerBypassOnDevelop ([bool](Get-RepoSetting $repoConfig 'ownerBypassOnDevelop')) `
+                -OwnerBypassOnMain ([bool](Get-RepoSetting $repoConfig 'ownerBypassOnMain')))
         }
 
         Sync-LegacyRulesets -Repo $name
