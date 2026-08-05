@@ -1,0 +1,24 @@
+name: PR Lifecycle (self)
+
+# This repository holds the governance config and the reconciler, so it is the last
+# place that should be exempt from its own rules. It cannot use the usual caller
+# filename because .github/workflows/pr-lifecycle.yml here IS the reusable workflow;
+# a file calling itself by that name would be ambiguous.
+#
+# Pinned to @main deliberately. Calling @develop would let a change to the lifecycle
+# gate its own review.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  lifecycle:
+    uses: lakshmanachari-panuganti/Repository-Administration-Governance/.github/workflows/pr-lifecycle.yml@main
+    with:
+      language: none
+      test-command: ''
+      enable-agents: false
+    secrets: inherit
