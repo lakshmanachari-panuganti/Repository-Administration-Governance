@@ -86,9 +86,32 @@ No praise. No style opinions. No summary of the diff.
 Open your review body with `AI review round N/5`, where N is one more than the
 highest round already present on the PR.
 
-**Submit exactly ONE review per round.** Batch every inline comment into a single
-`gh pr review` call using `--comment`/`--request-changes` with all comments
-attached; do not submit a review per finding.
+**Submit exactly ONE review per round**, batching every finding into it.
+
+`gh pr review` cannot attach inline comments — it accepts a body and nothing
+else. Use it only for a review with no anchored findings. For anchored findings
+post the review through the API, which takes the whole batch in one request:
+
+```bash
+cat > review.json <<'EOF'
+{
+  "event": "REQUEST_CHANGES",
+  "body": "AI review round N/5\n\n<summary>",
+  "comments": [
+    { "path": "src/pricing.js", "line": 47, "side": "RIGHT", "body": "<finding>" }
+  ]
+}
+EOF
+gh api repos/{owner}/{repo}/pulls/<number>/reviews --input review.json
+```
+
+`line` is the line number in the file **after** the change and must fall inside
+the diff hunks; `side` is `RIGHT` for added or context lines and `LEFT` for
+removed ones. Use `"start_line"` with `"line"` to span a range. An anchor outside
+the diff returns 422 and rejects the entire review, losing every comment in the
+batch — so if a finding concerns an untouched line, drop that one comment's
+anchor and state its `file:line` in the review body instead. Never retry a 422 by
+splitting the batch into several reviews; that is the review-storm failure below.
 
 Every submitted review fires a `pull_request_review` workflow run. A round that
 submitted five reviews queued five runs, and GitHub evicted the queued
