@@ -93,7 +93,7 @@ else. Use it only for a review with no anchored findings. For anchored findings
 post the review through the API, which takes the whole batch in one request:
 
 ```bash
-cat > review.json <<'EOF'
+gh api repos/{owner}/{repo}/pulls/<number>/reviews --input - <<'EOF'
 {
   "event": "REQUEST_CHANGES",
   "body": "AI review round N/5\n\n<summary>",
@@ -102,8 +102,11 @@ cat > review.json <<'EOF'
   ]
 }
 EOF
-gh api repos/{owner}/{repo}/pulls/<number>/reviews --input review.json
 ```
+
+The body goes to `gh` on stdin via `--input -`. Do not write it to a file first:
+you have no file-writing tool, so `cat > review.json` is refused and you fall
+back to an unanchored review having believed you were posting an anchored one.
 
 `line` is the line number in the file **after** the change and must fall inside
 the diff hunks; `side` is `RIGHT` for added or context lines and `LEFT` for
