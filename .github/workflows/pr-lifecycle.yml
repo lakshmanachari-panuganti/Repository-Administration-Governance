@@ -40,9 +40,30 @@ on:
         description: 'Reviewer rounds before handing over to a human.'
         type: number
         default: 5
+      agent-logins:
+        description: >-
+          Comma-separated logins treated as agents. Both spellings are included on purpose:
+          webhook payloads use "<slug>[bot]" while `gh pr view --json author` returns
+          "app/<slug>", and matching only one silently classifies every agent pull request
+          as human.
+        type: string
+        default: 'lakshmanachari-panuganti[bot],app/lakshmanachari-panuganti,devils-advocate-review[bot],app/devils-advocate-review,omg-ai-developer,devilsadvocate-reviewer'
+      agent-protected-paths:
+        description: >-
+          Comma-separated wildcard patterns the AI branch may not modify. These are the files
+          CI executes with credentials, not merely sensitive ones. Extend per repository;
+          do not narrow without deciding what runs the removed path.
+        type: string
+        default: '.github/*,.github/**,infra/*,infra/**,package.json,**/package.json,package-lock.json,**/package-lock.json,next.config.*,**/next.config.*,*.psd1,**/*.psd1'
 
 concurrency:
-  group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}
+  # Keyed by event type as well as pull request. Sharing one group across both events
+  # deadlocked a pull request permanently: the reviewer submitted five reviews, each
+  # queued a pull_request_review run in the same group, and GitHub evicts an older queued
+  # run when a newer one arrives. The pull_request run that publishes ai-review was
+  # cancelled before it started, so the required check never appeared on the fixed commit
+  # and nothing could ever unblock it.
+  group: pr-lifecycle-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ github.event_name }}
   cancel-in-progress: false
 
 # Left at contents: read. The organisation's default workflow permission is "read", and a
@@ -79,11 +100,29 @@ jobs:
           BASE: ${{ github.event.pull_request.base.ref }}
           HEAD: ${{ github.event.pull_request.head.ref }}
           AI_BRANCH: ${{ inputs.ai-branch }}
+          AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
         run: |
           $base = $env:BASE
           $head = $env:HEAD
           $ai   = $env:AI_BRANCH
           Write-Host "$head -> $base"
+
+          # Dependabot SECURITY updates always target the default branch and ignore
+          # target-branch in dependabot.yml — GitHub provides no setting for it. Closing
+          # them would silently stop every security fix from ever reaching the repository,
+          # so they are retargeted onto the promotion path instead of rejected.
+          #
+          # Matched on the numeric author id, never the branch name. A branch called
+          # dependabot/anything can be created by any identity with push access; user id
+          # 49699333 cannot be claimed. Verified against a live Dependabot pull request.
+          if ($base -eq 'main' -and $env:AUTHOR_ID -eq '49699333' -and $env:AUTHOR_TYPE -eq 'Bot') {
+              Write-Host 'Dependabot security update targeting main. Retargeting to develop.'
+              'retarget=true' >> $env:GITHUB_OUTPUT
+              'violation=' >> $env:GITHUB_OUTPUT
+              exit 0
+          }
+          'retarget=false' >> $env:GITHUB_OUTPUT
 
           $violation = switch ($base) {
               'main' {
@@ -108,6 +147,38 @@ jobs:
           }
           "violation=" >> $env:GITHUB_OUTPUT
           Write-Host 'Promotion path is valid.'
+
+      - name: Retarget a Dependabot security update onto develop
+        if: steps.validate.outputs.retarget == 'true'
+        uses: actions/create-github-app-token@v1
+        id: retarget-token
+        with:
+          app-id: ${{ vars.AI_DEVELOPER_APP_ID }}
+          private-key: ${{ secrets.AI_DEVELOPER_APP_KEY }}
+
+      - name: Move it to develop
+        if: steps.validate.outputs.retarget == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.retarget-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Closing these would silently stop every security fix from reaching the
+          # repository, because Dependabot ignores target-branch for security updates and
+          # always opens them against the default branch. Retargeting keeps exactly one
+          # path into main while letting the fix flow.
+          $body = @(
+              'Retargeted from `main` to `develop` automatically.'
+              ''
+              'Dependabot opens security updates against the default branch and ignores'
+              '`target-branch` for them, but `main` only accepts pull requests from'
+              '`develop`. This change now follows the promotion path and will reach'
+              '`main` with the next release.'
+          ) -join "`n"
+
+          gh api -X POST "/repos/$env:REPO/issues/$env:PR_NUMBER/comments" -f "body=$body" | Out-Null
+          gh api -X PATCH "/repos/$env:REPO/pulls/$env:PR_NUMBER" -f base='develop' --jq '"base is now " + .base.ref'
 
       # A failing check is not enough on its own. Check runs are keyed by commit, not by
       # pull request, so one commit that is the head of two pull requests has ONE
@@ -213,6 +284,9 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           AI_BRANCH: ${{ inputs.ai-branch }}
+          AGENT_PROTECTED_PATHS: ${{ inputs.agent-protected-paths }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          AGENT_LOGINS: ${{ inputs.agent-logins }}
         run: |
           $ErrorActionPreference = 'Stop'
           $failed = @()
@@ -239,9 +313,35 @@ jobs:
               # branch on purpose: a human changing CI is ordinary work that goes through
               # review, and forbidding it outright blocks the very pull request that
               # onboards a repository onto this workflow.
-              if ($env:HEAD_REF -eq $env:AI_BRANCH) {
-                  $ci = $files | Where-Object { $_ -like '.github/workflows/*' }
-                  if ($ci) { $failed += "agent branch modified workflow files: $($ci -join ', ')" }
+              # Scoped by AUTHOR, not by branch. Branch names are chosen by whoever pushes,
+              # so an agent that opened a pull request from feature/x rather than the AI
+              # branch would previously have skipped this check entirely. The author
+              # identity cannot be chosen.
+              #
+              # github.event.pull_request.user.login is the "<slug>[bot]" spelling. Note it
+              # differs from `gh pr view --json author`, which returns "app/<slug>" — both
+              # are matched here so the list stays correct wherever it is reused.
+              $agentLogins = @($env:AGENT_LOGINS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              $isAgentAuthored = [bool](@($agentLogins | Where-Object { $_ -eq $env:PR_AUTHOR }).Count)
+              Write-Host "author: $env:PR_AUTHOR (agent-authored: $isAgentAuthored)"
+
+              if ($isAgentAuthored) {
+                  # Withholding workflows:write from the Developer App stops it editing
+                  # .github/workflows, but not the other files that CI executes with
+                  # credentials: package.json scripts run on every npm ci, infra/** carries
+                  # the deployment definitions, and next.config.* runs at build time. Those
+                  # jobs hold Azure OIDC, so an agent editing any of them reaches production
+                  # without ever touching a workflow file.
+                  #
+                  # GitHub Free has no per-path ruleset restriction, so it has to live here.
+                  $protected = @($env:AGENT_PROTECTED_PATHS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                  $touched = $files | Where-Object {
+                      $file = $_
+                      $protected | Where-Object { $file -like $_ }
+                  }
+                  if ($touched) {
+                      $failed += "agent branch touched protected paths: $($touched -join ', ')"
+                  }
               }
           }
           else {
@@ -393,8 +493,17 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL || 'opus' }}
         run: |
+          # --allowedTools is required. Without it every gh call is refused by the CLI's
+          # permission prompt in a non-interactive runner, and the agent completes having
+          # posted nothing: the first real run reviewed the code correctly, found the
+          # planted defect, and then could not submit a single comment.
+          #
+          # gh is safe to allow here because the credential bounds it: GH_TOKEN is the
+          # Reviewer App's installation token, which holds contents:read. It can comment
+          # and publish checks; it cannot push, whatever it is persuaded to attempt.
           claude --model "$REVIEWER_MODEL" \
                  --agents pr-reviewer \
+                 --allowedTools "Bash(gh:*),Read,Grep,Glob" \
                  --output-format json \
                  -p "Review pull request #${PR_NUMBER} using the pr-reviewer subagent. On rounds after the first, review both the updated code and the developer's replies to your earlier comments. Approve by submitting an APPROVE review, or request changes with specific, actionable comments." \
                  | tee review-result.json
@@ -481,8 +590,13 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           DEVELOPER_MODEL: ${{ vars.DEVELOPER_MODEL || 'sonnet' }}
         run: |
+          # Same reason as the reviewer. The developer additionally needs Edit/Write to
+          # implement fixes and git to commit them. Its token is the Developer App's, which
+          # holds contents:write - the guard, not the tool list, is what stops it touching
+          # .github/, infra/, package.json and the other paths CI executes with credentials.
           claude --model "$DEVELOPER_MODEL" \
                  --agents pr-developer \
+                 --allowedTools "Bash(gh:*),Bash(git:*),Bash(npm:*),Read,Edit,Write,Grep,Glob" \
                  --output-format json \
                  -p "Address the open review comments on pull request #${PR_NUMBER} using the pr-developer subagent. Fix what is valid; rebut false positives with technical evidence. Do not modify anything under .github/workflows — the guard rejects it." \
                  | tee respond-result.json

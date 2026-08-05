@@ -97,7 +97,9 @@ function New-RulesetBody {
         [bool]$HasCodeowners = $false,
         # Same hazard: requiring ai-review in a repository that has not adopted the
         # lifecycle workflow means no job can ever publish that check.
-        [bool]$HasLifecycle = $false
+        [bool]$HasLifecycle = $false,
+        # Temporary. See ownerBypassOnDevelop in repositories.json.
+        [bool]$OwnerBypassOnDevelop = $false
     )
 
     $rules = @(
@@ -176,14 +178,29 @@ function New-RulesetBody {
         }
     }
 
+    # main keeps an empty bypass list: "enforce repository administrators to follow the
+    # same protection rules". Nothing, including the owner, merges to production without
+    # code-owner approval.
+    #
+    # develop grants the organisation owner a bypass in pull_request mode, because GitHub
+    # has no way to let anyone approve their own pull request and this organisation has one
+    # human. Without it the sole maintainer cannot merge their own work at all.
+    #
+    # pull_request mode, not always: a pull request is still required and direct pushes are
+    # still refused. Only the approval requirement is waived, and only for a named human -
+    # the Developer App is deliberately not on this list, so it still cannot self-merge.
+    $bypass = @()
+    if ($Branch -eq 'develop' -and $OwnerBypassOnDevelop) {
+        $bypass = @(@{ actor_type = 'OrganizationAdmin'; actor_id = 1; bypass_mode = 'pull_request' })
+    }
+
     return @{
         name          = "governance: $Branch"
         target        = 'branch'
         enforcement   = 'active'
         conditions    = @{ ref_name = @{ include = @("refs/heads/$Branch"); exclude = @() } }
         rules         = $rules
-        # Empty: "enforce repository administrators to follow the same protection rules".
-        bypass_actors = @()
+        bypass_actors = $bypass
     }
 }
 
@@ -516,7 +533,8 @@ foreach ($name in $repoNames) {
                 $checks = @($extra.$branch)
             }
             Sync-Ruleset -Repo $name -Body (New-RulesetBody -Branch $branch -ExtraChecks $checks `
-                -HasCodeowners $hasCodeowners -HasLifecycle $hasLifecycle)
+                -HasCodeowners $hasCodeowners -HasLifecycle $hasLifecycle `
+                -OwnerBypassOnDevelop ([bool](Get-RepoSetting $repoConfig 'ownerBypassOnDevelop')))
         }
 
         Sync-LegacyRulesets -Repo $name
