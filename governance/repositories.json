@@ -48,9 +48,16 @@
     "www.srilatha.art": {
       "language": "node",
       "enableAgents": true,
+      "$comment": [
+        "ci/agent-guard removed from the required checks: the centralised lifecycle now",
+        "publishes ai-review and enforces the same invariants, so requiring both meant",
+        "running two guards over every pull request. The requirement is dropped BEFORE",
+        "agent-guard.yml is deleted - removing the workflow first would leave a required",
+        "check nothing can publish and block develop permanently."
+      ],
       "extraRequiredChecks": {
         "main": [],
-        "develop": ["ci/agent-guard"]
+        "develop": []
       }
     },
     "Repository-Administration-Governance": {

@@ -550,9 +550,20 @@ foreach ($name in $repoNames) {
         Sync-SecuritySettings   -Repo $name
         $hasCodeowners = Sync-Codeowners -Repo $name -DefaultBranch $defaultBranch
 
-        $hasLifecycle = Test-LifecycleAdopted -Repo $name -DefaultBranch $defaultBranch
-        if (-not $hasLifecycle) {
-            Write-Warn "$name has not adopted .github/workflows/pr-lifecycle.yml. The ai-review gate is left off until it does — requiring a check nothing can publish would block the branch permanently."
+        # Adoption is per BRANCH, not per repository. A pull request runs the workflow
+        # present on the branch it targets, so develop can be gated as soon as the caller
+        # reaches develop - waiting for it to arrive on main would leave develop ungated for
+        # the whole promotion cycle. Conversely main must not require ai-review until the
+        # caller is actually on main, or the first release deadlocks.
+        $lifecycleOn = @{}
+        foreach ($b in @('develop', 'main')) {
+            $lifecycleOn[$b] = Test-LifecycleAdopted -Repo $name -DefaultBranch $b
+        }
+        if (-not $lifecycleOn['develop'] -and -not $lifecycleOn['main']) {
+            Write-Warn "$name has not adopted .github/workflows/pr-lifecycle.yml on develop or main. The ai-review gate is left off until it does — requiring a check nothing can publish would block the branch permanently."
+        }
+        elseif (-not $lifecycleOn['main']) {
+            Write-Warn "$name has the lifecycle on develop but not yet on main. develop is gated by ai-review; main is not, and will be once the caller reaches it via a release."
         }
 
         $extra = Get-RepoSetting $repoConfig 'extraRequiredChecks'
@@ -561,8 +572,9 @@ foreach ($name in $repoNames) {
             if ($branch -ne 'ai-driven1' -and (Test-HasProperty $extra $branch)) {
                 $checks = @($extra.$branch)
             }
+            $branchHasLifecycle = if ($lifecycleOn.ContainsKey($branch)) { [bool]$lifecycleOn[$branch] } else { $false }
             Sync-Ruleset -Repo $name -Body (New-RulesetBody -Branch $branch -ExtraChecks $checks `
-                -HasCodeowners $hasCodeowners -HasLifecycle $hasLifecycle `
+                -HasCodeowners $hasCodeowners -HasLifecycle $branchHasLifecycle `
                 -OwnerBypassOnDevelop ([bool](Get-RepoSetting $repoConfig 'ownerBypassOnDevelop')))
         }
 
